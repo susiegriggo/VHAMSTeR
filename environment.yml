@@ -1,0 +1,22 @@
+name: vhamster
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pytorch
+  - pytorch-cuda=12.1          # change to match your cluster's CUDA version
+  - pip
+  - pip:
+      - transformers
+      - peft
+      - numpy
+      - polars
+      - biopython
+      - pyrodigal-gv
+      - pyrodigal-rv
+      - tqdm
+      - scikit-learn
+      - -e .                   # installs vhamster itself in editable mode

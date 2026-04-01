@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vhamster"
+version = "1.0.0"
+description = "vHAMSTeR ensemble inference CLI"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy",
+  "polars",
+  "torch",
+  "tqdm",
+  "transformers",
+  "peft",
+  "biopython",
+  "pyrodigal-gv",
+  "pyrodigal-rv",
+  "scikit-learn",
+]
+
+[project.scripts]
+vhamster = "vhamster:main"
+
+[tool.setuptools]
+py-modules = ["vhamster"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src"]
