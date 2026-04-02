@@ -9,6 +9,8 @@ description = "vHAMSTeR ensemble inference CLI"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+  "click",
+  "loguru",
   "numpy",
   "polars",
   "torch",

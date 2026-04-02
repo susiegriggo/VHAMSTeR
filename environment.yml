@@ -10,6 +10,8 @@ dependencies:
   - pytorch-cuda=12.1          # change to match your cluster's CUDA version
   - pip
   - pip:
+      - click
+      - loguru
       - transformers
       - peft
       - numpy

@@ -2,7 +2,7 @@
 """
 V-HAMSTeR 
 ==============================================================
-Virus Host Assignment Model using Sequence Transformers and Reading-frames.
+Virus Host Assignment Model using Sequence Transformers and Reading-frame.
 Run inference using the full 5-fold deep ensemble and apply the joint
 temperature T_joint (from calibrate_joint_temperature.py) before converting
 logits to probabilities.
@@ -22,20 +22,22 @@ Flow
 
 __version__ = "1.0.0"
 
-import argparse
 import gc
 import json
 import multiprocessing
 import pathlib
 import re
 import sys
+from types import SimpleNamespace
 from concurrent.futures import ProcessPoolExecutor
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any, Union
 
+import click
 import numpy as np
 import polars as pl
 import torch
 import torch.nn.functional as F
+from loguru import logger
 from torch import nn
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
@@ -54,7 +56,7 @@ from src.sequences import GenomeDataset, load_fasta_sequences
 
 # ── local helper functions (self-contained; no external calibration dependency) ─
 
-def _discover_fold_dirs(args: argparse.Namespace) -> List[pathlib.Path]:
+def _discover_fold_dirs(args: Any) -> List[pathlib.Path]:
     """Resolve fold directories from --fold-dirs or --ensemble-dir."""
     if args.fold_dirs:
         fold_dirs = [pathlib.Path(p).resolve() for p in args.fold_dirs]
@@ -217,18 +219,42 @@ def _aggregate_chunks(
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _load_temperature(temperature_file: Optional[pathlib.Path]) -> float:
-    """Load the optimised T_joint scalar saved by calibrate_joint_temperature.py."""
-    if temperature_file is None or not temperature_file.exists():
-        if temperature_file is not None:
-            print(f"[WARN] Temperature file not found: {temperature_file}. Using T=1.0 (no calibration).")
+def _load_temperature(temperature_value: Optional[Union[str, pathlib.Path, float]]) -> float:
+    """Load temperature from either a numeric value or a saved .pt file.
+
+    Accepted inputs:
+    - float/int-like string, e.g. "1.0", "2.35"
+    - pathlib.Path / path string to a torch-saved object with key T_joint or scalar
+    """
+    if temperature_value is None:
         return 1.0
+
+    # Allow direct scalar input for quick benchmarking.
+    if isinstance(temperature_value, (int, float)):
+        t = float(temperature_value)
+        logger.info(f"Using temperature scalar T = {t:.8f} from CLI")
+        return t
+
+    value_str = str(temperature_value)
+    try:
+        t = float(value_str)
+        logger.info(f"Using temperature scalar T = {t:.8f} from CLI")
+        return t
+    except (TypeError, ValueError):
+        pass
+
+    # Fall back to path-based loading.
+    temperature_file = pathlib.Path(value_str)
+    if not temperature_file.exists():
+        logger.warning(f"Temperature file not found: {temperature_file}. Using T=1.0 (no calibration).")
+        return 1.0
+
     state = torch.load(temperature_file, map_location="cpu")
     if isinstance(state, dict):
         t = float(state.get("T_joint", 1.0))
     else:
         t = float(state)
-    print(f"      Loaded T_joint = {t:.8f} from {temperature_file}")
+    logger.info(f"Loaded T_joint = {t:.8f} from {temperature_file}")
     return t
 
 
@@ -272,10 +298,10 @@ def _align_fold_probs_to_reference(
             "Cannot safely ensemble across folds with mismatched class sets."
         )
 
-    print(
-        f"      [WARN] {fold_name} label index order differs from reference; "
-        "reordering fold probabilities by class name before averaging."
-    )
+        logger.warning(
+            f"{fold_name} label index order differs from reference; "
+            "reordering fold probabilities by class name before averaging."
+        )
     reorder_tensor = torch.tensor(reorder_idx, dtype=torch.long)
     return fold_probs.index_select(dim=1, index=reorder_tensor)
 
@@ -310,10 +336,10 @@ def _build_fold_classifier(
     # Match predict_genome.py LoRA loading behavior.
     ckpt_dir = fold_dir / checkpoint_subdir
     if (ckpt_dir / "adapter_config.json").exists():
-        print(f"      LoRA adapters detected in {ckpt_dir.name} — injecting into base model...")
+        logger.info(f"LoRA adapters detected in {ckpt_dir.name}; injecting into base model...")
         base_model = PeftModel.from_pretrained(base_model, ckpt_dir)
     elif (fold_dir / "adapter_config.json").exists():
-        print(f"      LoRA adapters detected in {fold_dir.name} — injecting into base model...")
+        logger.info(f"LoRA adapters detected in {fold_dir.name}; injecting into base model...")
         base_model = PeftModel.from_pretrained(base_model, fold_dir)
 
     label_mapping = config.get("label_mapping", {})
@@ -377,8 +403,8 @@ def _build_fold_classifier(
             filtered_state[key] = value
 
     classifier.load_state_dict(filtered_state, strict=False)
-    print(
-        f"      Loaded {len(filtered_state)}/{len(ckpt_state)} checkpoint keys for {fold_dir.name}"
+    logger.info(
+        f"Loaded {len(filtered_state)}/{len(ckpt_state)} checkpoint keys for {fold_dir.name}"
     )
 
     classifier.to(device)
@@ -421,7 +447,7 @@ def _extract_features(
     config: Dict,
 ) -> Tuple[List[List[float]], Optional[List[List[float]]]]:
     """Parallel feature extraction + scaler normalisation matching training."""
-    print(f"      {len(feature_names)} features × {len(chunked_seqs)} chunk(s)")
+    logger.info(f"{len(feature_names)} features x {len(chunked_seqs)} chunk(s)")
     n_workers = min(multiprocessing.cpu_count(), len(chunked_seqs), 8)
     args_list = [
         (seq, acc, use_rv, feature_names, chunk_size)
@@ -477,123 +503,26 @@ def _collect_logits(
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _cli() -> argparse.Namespace:
-    _argv = sys.argv[1:]
-    if not _argv or "-h" in _argv or "--help" in _argv:
-        print(f"""\
-V-HAMSTeR Ensemble Predictor  v{__version__}
-============================================================
-Virus Host Assignment Method using Sequence Transformers and Reading-frames.
-Predict viral genome host using a 5-fold deep ensemble with joint temperature
-calibration.
-
-Usage:
-    vhamster --fasta <genomes.fna> --output <out_dir> \
-    --ensemble-dir <cv_output_dir> --temperature-file <joint_temperature.pt>
-
-Required:
-  --fasta PATH              Input FASTA file.
-    --output PATH             Output directory for auto-named chunk+genome TSVs.
-  --ensemble-dir PATH       Root directory containing fold_0..fold_N subdirs.
-
-Common options:
-  --fold-dirs PATH [PATH …] Explicit fold directories (overrides --ensemble-dir).
-  --num-folds INT           Number of folds to use. (default: 5)
-  --checkpoint-subdir STR   Checkpoint subdirectory name. (default: best_macro_f1_model)
-  --temperature-file PATH   Saved T_joint file from calibrate_joint_temperature.py.
-                            If omitted, T=1.0 is used (no calibration).
-  --force, -f               Overwrite output if it exists.
-  --chunk-size INT          Chunk length in bp. (default: 10000)
-  --overlap INT             Overlap between chunks in bp. (default: 1000)
-  --use-rv                  Use RNA-virus gene caller for feature extraction.
-  --batch-size INT          Inference batch size. (default: 16)
-  --fp16                    Use FP16 mixed precision.
-  --num-workers INT         DataLoader workers. (default: 4)
-    --aggregate-chunks / --no-aggregate-chunks
-                                                        Enable/disable genome-level consensus output.
-                                                        Mean-pools calibrated chunk probabilities per parent
-                                                        sequence. (default: enabled)
-  --genome-output PATH      Path for the genome-level TSV. Defaults to
-                            <output>/<prefix>.genomes.tsv when --aggregate-chunks
-                            is set and this flag is omitted.
-    --prefix STR             Base filename prefix for outputs in --output.
-                                                     (default: ensemble_predictions)
-""")
-        sys.exit(0)
-
-    parser = argparse.ArgumentParser(prog="vhamster", add_help=False)
-
-    # I/O
-    parser.add_argument("--fasta", type=pathlib.Path, required=True)
-    parser.add_argument("--output", type=pathlib.Path, required=True)
-    parser.add_argument("--prefix", type=str, default="ensemble_predictions")
-    parser.add_argument("--force", "-f", action="store_true")
-
-    # Ensemble
-    parser.add_argument("--ensemble-dir", type=pathlib.Path, default=_ROOT / "model" / "best_params_20260331")
-    parser.add_argument("--fold-dirs", nargs="+", default=None)
-    parser.add_argument("--num-folds", type=int, default=5)
-    parser.add_argument("--checkpoint-subdir", type=str, default="best_macro_f1_model")
-    parser.add_argument("--temperature-file", type=pathlib.Path, default=_ROOT / "model" / "joint_temperature.pt")
-
-    # Sequence processing
-    parser.add_argument("--chunk-size", type=int, default=10000)
-    parser.add_argument("--overlap", type=int, default=1000)
-    parser.add_argument("--use-rv", action="store_true")
-
-    # Performance
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--fp16", action="store_true")
-    parser.add_argument("--num-workers", type=int, default=4)
-
-    # Chunk aggregation
-    parser.add_argument(
-        "--aggregate-chunks",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help=(
-            "Write genome-level consensus output by mean-pooling calibrated chunk "
-            "probabilities per parent genome. Use --no-aggregate-chunks to disable."
-        ),
-    )
-    parser.add_argument(
-        "--genome-output", type=pathlib.Path, default=None,
-        help="Path for the genome-level TSV (default: <output>/<prefix>.genomes.tsv).",
-    )
-
-    args = parser.parse_args()
-
-    # Resolve output paths from output directory + prefix.
-    args.output_dir = args.output
-    args.output = args.output_dir / f"{args.prefix}.chunks.tsv"
-    if args.aggregate_chunks and args.genome_output is None:
-        args.genome_output = args.output_dir / f"{args.prefix}.genomes.tsv"
-
-    # Resolve fold dirs using the same helper as the calibration script.
-    args.fold_dirs_resolved = _discover_fold_dirs(args)
-    if args.num_folds > len(args.fold_dirs_resolved):
-        sys.exit(
-            f"ERROR: --num-folds={args.num_folds} but only "
-            f"{len(args.fold_dirs_resolved)} fold directories were found."
-        )
-    args.fold_dirs_resolved = args.fold_dirs_resolved[: args.num_folds]
-
-    return args
+def _configure_logging(output_dir: pathlib.Path, prefix: str) -> pathlib.Path:
+    """Configure loguru sinks for console + file in output directory."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log_path = output_dir / f"{prefix}.log"
+    logger.remove()
+    logger.add(sys.stderr, level="INFO", colorize=False)
+    logger.add(log_path, level="DEBUG", enqueue=True, backtrace=False, diagnose=False)
+    return log_path
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
-def main() -> None:
-    args = _cli()
+def _run(args: Any) -> None:
 
-    print()
-    print("=" * 68)
-    print(f"  V-HAMSTeR Ensemble Predictor  v{__version__}")
-    print("=" * 68)
-    print("  Virus Host Assignment Method using Sequence Transformers and Reading-frames")
-    print()
+    logger.info("=" * 68)
+    logger.info(f"V-HAMSTeR Ensemble Predictor v{__version__}")
+    logger.info("Virus Host Assignment Model using Sequence Transformers and Reading-frame")
+    logger.info("=" * 68)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -620,9 +549,9 @@ def main() -> None:
         sys.exit("ERROR: --overlap must be smaller than --chunk-size.")
 
     # ── [1/5] Configuration ───────────────────────────────────────────────────
-    print("[1/5] Loading configuration")
-    print(f"      Fold directories : {[str(p) for p in args.fold_dirs_resolved]}")
-    print(f"      Device           : {device}")
+    logger.info("[1/5] Loading configuration")
+    logger.info(f"Fold directories: {[str(p) for p in args.fold_dirs_resolved]}")
+    logger.info(f"Device: {device}")
 
     # All folds share the same training config; use fold 0 as the reference.
     ref_config = _load_fold_config(args.fold_dirs_resolved[0], args.checkpoint_subdir)
@@ -635,32 +564,29 @@ def main() -> None:
     max_length: int = int(ref_config.get("max_length", 10000))
     feature_integration_mode: str = ref_config.get("feature_integration_mode", "concat")
 
-    print(f"      Classes          : {num_classes}  ({list(label_mapping.values())})")
-    print(f"      Architecture     : {model_type}")
-    print(f"      Feature stream   : {use_features} ({len(feature_names)} features)")
-    print(f"      Integration mode : {feature_integration_mode}")
+    logger.info(f"Classes: {num_classes} ({list(label_mapping.values())})")
+    logger.info(f"Architecture: {model_type}")
+    logger.info(f"Feature stream: {use_features} ({len(feature_names)} features)")
+    logger.info(f"Integration mode: {feature_integration_mode}")
 
     T_joint: float = _load_temperature(args.temperature_file)
-    print(f"      Temperature      : {T_joint:.8f}")
+    logger.info(f"Temperature: {T_joint:.8f}")
     if T_joint > 5.0:
-        print(
-            "      [WARN] Large temperature detected; probabilities may be very flat "
-            "(close to uniform)."
+        logger.warning(
+            "Large temperature detected; probabilities may be very flat (close to uniform)."
         )
 
     # ── [2/5] Chunking ────────────────────────────────────────────────────────
-    print()
-    print("[2/5] Loading and chunking sequences")
+    logger.info("[2/5] Loading and chunking sequences")
     seqs, accessions = load_fasta_sequences(str(args.fasta))
     chunked_seqs, chunked_accs = _chunk_sequences(seqs, accessions, args.chunk_size, args.overlap)
-    print(
-        f"      {len(accessions)} sequence(s) → {len(chunked_seqs)} chunk(s) "
+    logger.info(
+        f"{len(accessions)} sequence(s) -> {len(chunked_seqs)} chunk(s) "
         f"(chunk: {args.chunk_size:,} bp, overlap: {args.overlap:,} bp)"
     )
 
     # ── [3/5] Feature extraction ──────────────────────────────────────────────
-    print()
-    print("[3/5] Extracting gene features")
+    logger.info("[3/5] Extracting gene features")
     raw_features: Optional[List[List[float]]] = None
     scaled_features: Optional[List[List[float]]] = None
 
@@ -674,11 +600,10 @@ def main() -> None:
             config=ref_config,
         )
     else:
-        print("      Feature stream disabled — skipping.")
+        logger.info("Feature stream disabled; skipping.")
 
     # ── [4/5] Ensemble inference ──────────────────────────────────────────────
-    print()
-    print("[4/5] Running ensemble inference")
+    logger.info("[4/5] Running ensemble inference")
 
     # Build one shared tokenizer + dataset/dataloader from the reference config.
     ref_tokenizer = AutoTokenizer.from_pretrained(
@@ -719,7 +644,7 @@ def main() -> None:
     accumulated_probs: Optional[torch.Tensor] = None
 
     for fold_idx, fold_dir in enumerate(args.fold_dirs_resolved, start=1):
-        print(f"  Fold {fold_idx}/{args.num_folds} — {fold_dir.name}")
+        logger.info(f"Fold {fold_idx}/{args.num_folds}: {fold_dir.name}")
         classifier, _, fold_config = _build_fold_classifier(fold_dir, args.checkpoint_subdir, device)
 
         # Raw logits from this fold's model [N, C]
@@ -756,8 +681,7 @@ def main() -> None:
     all_accessions = chunked_accs
 
     # ── [5/5] Writing output ──────────────────────────────────────────────────
-    print()
-    print("[5/5] Writing results")
+    logger.info("[5/5] Writing results")
 
     class_cols = [label_mapping.get(i, f"class_{i}") for i in range(num_classes)]
     pred_indices = np.argmax(calibrated_probs, axis=1)
@@ -807,9 +731,8 @@ def main() -> None:
     # ── Optional genome-level aggregation ────────────────────────────────────
     genome_df: Optional[pl.DataFrame] = None
     if args.aggregate_chunks:
-        print()
-        print("Aggregating chunk predictions → genome-level consensus")
-        print("      Method: mean-pool calibrated class probabilities per parent genome")
+        logger.info("Aggregating chunk predictions -> genome-level consensus")
+        logger.info("Method: mean-pool calibrated class probabilities per parent genome")
         genome_df = _aggregate_chunks(
             chunk_df=df,
             class_cols=class_cols,
@@ -826,32 +749,122 @@ def main() -> None:
             )
         args.genome_output.parent.mkdir(parents=True, exist_ok=True)
         genome_df.write_csv(args.genome_output, separator="\t")
-        print(f"      Genome-level output : {args.genome_output}")
+        logger.info(f"Genome-level output: {args.genome_output}")
 
     # ── Summary ───────────────────────────────────────────────────────────────
-    print()
-    print("=" * 68)
-    print("  Done!")
-    print(f"  Sequences processed : {len(accessions)}")
-    print(f"  Chunks processed    : {len(chunked_seqs)}")
-    print(f"  Folds used          : {args.num_folds}")
-    print(f"  Temperature (T)     : {T_joint:.6f}")
-    print(f"  Chunk output        : {args.output}")
+    logger.info("=" * 68)
+    logger.info("Done!")
+    logger.info(f"Sequences processed: {len(accessions)}")
+    logger.info(f"Chunks processed: {len(chunked_seqs)}")
+    logger.info(f"Folds used: {args.num_folds}")
+    logger.info(f"Temperature (T): {T_joint:.6f}")
+    logger.info(f"Chunk output: {args.output}")
     if prok_col_idx is not None:
         n_prok = sum(1 for h in predicted_hosts if "prokaryote" in h.lower())
-        print(f"  Prokaryotic chunks  : {n_prok}")
-        print(f"  Eukaryotic chunks   : {len(predicted_hosts) - n_prok}")
+        logger.info(f"Prokaryotic chunks: {n_prok}")
+        logger.info(f"Eukaryotic chunks: {len(predicted_hosts) - n_prok}")
     if genome_df is not None:
         genome_preds = genome_df["predicted_host"].to_list()
-        print(f"  Genome output       : {args.genome_output}")
-        print("  Consensus mode      : mean-pooled calibrated probabilities")
-        print(f"  Genomes predicted   : {len(genome_preds)}")
+        logger.info(f"Genome output: {args.genome_output}")
+        logger.info("Consensus mode: mean-pooled calibrated probabilities")
+        logger.info(f"Genomes predicted: {len(genome_preds)}")
         if prok_col_idx is not None:
             n_prok_g = sum(1 for h in genome_preds if "prokaryote" in h.lower())
-            print(f"  Prokaryotic genomes : {n_prok_g}")
-            print(f"  Eukaryotic genomes  : {len(genome_preds) - n_prok_g}")
-    print("=" * 68)
-    print()
+            logger.info(f"Prokaryotic genomes: {n_prok_g}")
+            logger.info(f"Eukaryotic genomes: {len(genome_preds) - n_prok_g}")
+    logger.info("=" * 68)
+
+
+@click.command(context_settings={"help_option_names": ["-h", "--help"]})
+@click.option("--fasta", type=click.Path(path_type=pathlib.Path, exists=True, dir_okay=False), required=True, help="Input FASTA file.")
+@click.option("--output", type=click.Path(path_type=pathlib.Path, file_okay=False), required=True, help="Output directory.")
+@click.option("--prefix", default="ensemble_predictions", show_default=True, help="Base filename prefix for outputs.")
+@click.option("--force", "force", is_flag=True, help="Overwrite output if it exists.")
+@click.option("--ensemble-dir", type=click.Path(path_type=pathlib.Path), default=_ROOT / "model" / "best_params_20260331", show_default=True, help="Root directory containing fold_* subdirs.")
+@click.option("--fold-dirs", type=click.Path(path_type=pathlib.Path), multiple=True, help="Explicit fold directories (overrides --ensemble-dir).")
+@click.option("--num-folds", type=int, default=5, show_default=True, help="Number of folds to use.")
+@click.option("--fold-index", type=int, default=None, help="Use only one fold by index, e.g. 0..4.")
+@click.option("--checkpoint-subdir", default="best_macro_f1_model", show_default=True, help="Checkpoint subdirectory name.")
+@click.option("--temperature-file", type=str, default=str(_ROOT / "model" / "joint_temperature.pt"), show_default=True, help="Temperature as scalar (e.g. 1.0) or path to saved T_joint file.")
+@click.option("--chunk-size", type=int, default=10000, show_default=True, help="Chunk length in bp.")
+@click.option("--overlap", type=int, default=1000, show_default=True, help="Overlap between chunks in bp.")
+@click.option("--use-rv", is_flag=True, help="Use RNA-virus gene caller for feature extraction.")
+@click.option("--batch-size", type=int, default=16, show_default=True, help="Inference batch size.")
+@click.option("--fp16", is_flag=True, help="Use FP16 mixed precision.")
+@click.option("--num-workers", type=int, default=4, show_default=True, help="DataLoader workers.")
+@click.option("--aggregate-chunks/--no-aggregate-chunks", default=True, show_default=True, help="Enable/disable genome-level consensus output.")
+@click.option("--genome-output", type=click.Path(path_type=pathlib.Path), default=None, help="Path for genome-level TSV output.")
+def main(
+    fasta: pathlib.Path,
+    output: pathlib.Path,
+    prefix: str,
+    force: bool,
+    ensemble_dir: pathlib.Path,
+    fold_dirs: Tuple[pathlib.Path, ...],
+    num_folds: int,
+    fold_index: Optional[int],
+    checkpoint_subdir: str,
+    temperature_file: str,
+    chunk_size: int,
+    overlap: int,
+    use_rv: bool,
+    batch_size: int,
+    fp16: bool,
+    num_workers: int,
+    aggregate_chunks: bool,
+    genome_output: Optional[pathlib.Path],
+) -> None:
+    output_dir = output
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log_path = _configure_logging(output_dir, prefix)
+
+    args = SimpleNamespace(
+        fasta=fasta,
+        output_dir=output_dir,
+        output=output_dir / f"{prefix}.chunks.tsv",
+        prefix=prefix,
+        force=force,
+        ensemble_dir=ensemble_dir,
+        fold_dirs=list(fold_dirs) if fold_dirs else None,
+        num_folds=num_folds,
+        fold_index=fold_index,
+        checkpoint_subdir=checkpoint_subdir,
+        temperature_file=temperature_file,
+        chunk_size=chunk_size,
+        overlap=overlap,
+        use_rv=use_rv,
+        batch_size=batch_size,
+        fp16=fp16,
+        num_workers=num_workers,
+        aggregate_chunks=aggregate_chunks,
+        genome_output=genome_output,
+    )
+
+    if args.aggregate_chunks and args.genome_output is None:
+        args.genome_output = args.output_dir / f"{args.prefix}.genomes.tsv"
+
+    args.fold_dirs_resolved = _discover_fold_dirs(args)
+    if args.fold_index is not None:
+        if args.fold_index < 0:
+            raise click.ClickException("--fold-index must be >= 0.")
+        target_name = f"fold_{args.fold_index}"
+        selected = next((p for p in args.fold_dirs_resolved if p.name == target_name), None)
+        if selected is None:
+            available = [p.name for p in args.fold_dirs_resolved]
+            raise click.ClickException(
+                f"Requested {target_name}, but it was not found. Available folds: {available}"
+            )
+        args.fold_dirs_resolved = [selected]
+    else:
+        if args.num_folds > len(args.fold_dirs_resolved):
+            raise click.ClickException(
+                f"--num-folds={args.num_folds} but only {len(args.fold_dirs_resolved)} fold directories were found."
+            )
+        args.fold_dirs_resolved = args.fold_dirs_resolved[: args.num_folds]
+    args.num_folds = len(args.fold_dirs_resolved)
+
+    logger.info(f"Logging to: {log_path}")
+    _run(args)
 
 
 if __name__ == "__main__":

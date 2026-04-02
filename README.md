@@ -1,6 +1,6 @@
 # V-HAMSTeR
 
-**V**irus **H**ost **A**ssignment **M**ethod using **S**equence **T**ransformers and **R**eading-frames
+**V**irus **H**ost **A**ssignment **M**odel using **S**equence **T**ransformers and **R**eading-frame
 
 V-HAMSTeR uses a genomic language model to predict the host of a virus as one of: animal, plant, fungi, protist, or prokaryote.
 
@@ -25,6 +25,8 @@ It runs a 5-fold ensemble and writes:
 
 ## Dependencies
 
+- `click`
+- `loguru`
 - `torch`
 - `transformers`
 - `peft`
@@ -71,6 +73,9 @@ pip install -e .
 This installs all dependencies listed in `pyproject.toml` and registers the
 `vhamster` shell command.  Install PyTorch separately first (see above) if you
 need GPU/CUDA support, as the default `torch` wheel may be CPU-only.
+
+Runtime logs are written to `<output>/<prefix>.log` and also shown in the
+terminal.
 
 ## Quick-start example
 
@@ -137,6 +142,16 @@ vhamster \
   --ensemble-dir /path/to/model_root_with_fold_dirs
 ```
 
+Benchmark using a single fold model (for example, only `fold_3`):
+
+```bash
+vhamster \
+  --fasta /path/to/input.fasta \
+  --output /path/to/results_dir \
+  --ensemble-dir /path/to/model_root_with_fold_dirs \
+  --fold-index 3
+```
+
 Use a non-default temperature file:
 
 ```bash
@@ -144,6 +159,15 @@ vhamster \
   --fasta /path/to/input.fasta \
   --output /path/to/results_dir \
   --temperature-file /path/to/joint_temperature.pt
+```
+
+You can also pass temperature directly as a scalar (useful for benchmarking):
+
+```bash
+vhamster \
+  --fasta /path/to/input.fasta \
+  --output /path/to/results_dir \
+  --temperature-file 1.0
 ```
 
 ## Outputs
