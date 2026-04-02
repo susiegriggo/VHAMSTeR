@@ -19,7 +19,6 @@ dependencies = [
   "peft>=0.18,<1",
   "biopython>=1.87,<2",
   "pyrodigal-gv>=0.3.2,<0.4",
-  "pyrodigal-rv>=0.1.0,<0.2",
   "scikit-learn>=1.8,<2",
   "requests>=2.33,<3",
 ]

@@ -18,7 +18,6 @@ dependencies:
       - polars==1.39.3
       - biopython==1.87
       - pyrodigal-gv==0.3.2
-      - pyrodigal-rv==0.1.0
       - tqdm==4.67.3
       - scikit-learn==1.8.0
       - requests==2.33.1

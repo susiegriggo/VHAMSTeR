@@ -4,7 +4,6 @@ modules to precompute features using pyrodigal
 """
 
 # imports 
-import pyrodigal_rv
 import pyrodigal_gv
 from typing import Dict, List, Any
 
@@ -33,12 +32,9 @@ def classify_rbs_motif(motif: str) -> Dict[str, bool]:
         'tatata': is_tatata
     }
 
-def predict_orfs_with_rbs(seq: str, min_len: int = 90, meta: bool = True, use_rv: bool = False) -> List[Dict[str, Any]]:
+def predict_orfs_with_rbs(seq: str, min_len: int = 90, meta: bool = True) -> List[Dict[str, Any]]:
     """Run Prodigal on sequence."""
-    if use_rv:
-        gene_finder = pyrodigal_rv.ViralGeneFinder(meta=True)
-    else:
-        gene_finder = pyrodigal_gv.ViralGeneFinder(meta=True)
+    gene_finder = pyrodigal_gv.ViralGeneFinder(meta=True)
     
     genes = gene_finder.find_genes(bytes(seq.encode()))
     orfs = []
@@ -73,12 +69,12 @@ def predict_orfs_with_rbs(seq: str, min_len: int = 90, meta: bool = True, use_rv
         })
     return orfs
 
-def extract_features(seq: str, genome_name: str, use_rv: bool = False, chunk_size: int = 10000) -> Dict[str, Any]:
+def extract_features(seq: str, genome_name: str, chunk_size: int = 10000) -> Dict[str, Any]:
     """Extract features from a single sequence, including fragment_size as a portion of chunk_size."""
     seq_len = len(seq)
     seq_len_kb = seq_len / 1000.0
     fragment_size = seq_len / chunk_size if chunk_size > 0 else 0.0
-    orfs = predict_orfs_with_rbs(seq, use_rv=use_rv)
+    orfs = predict_orfs_with_rbs(seq)
     
     if not orfs:
         return {
@@ -119,7 +115,7 @@ def extract_features(seq: str, genome_name: str, use_rv: bool = False, chunk_siz
 
 def extract_features_worker(args):
     """Worker for parallel feature extraction."""
-    # Accepts (seq, acc, use_rv, feature_names, chunk_size) only
-    seq, acc, use_rv, feature_names, chunk_size = args
-    feat_dict = extract_features(seq, acc, use_rv=use_rv, chunk_size=chunk_size)
+    # Accepts (seq, acc, feature_names, chunk_size) only
+    seq, acc, feature_names, chunk_size = args
+    feat_dict = extract_features(seq, acc, chunk_size=chunk_size)
     return [feat_dict[name] for name in feature_names]

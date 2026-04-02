@@ -128,7 +128,6 @@ def load_data(
     labels_file: pathlib.Path,
     test_size: float = 0.2,
     random_seed: int = 42,
-    use_rv: bool = False,
     use_features: bool = True,
     use_class_weights: bool = False,
     features_file: pathlib.Path = None,
@@ -202,7 +201,7 @@ def load_data(
             logger.info(f"Using {num_workers} workers for parallel feature extraction...")
             
             with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
-                args_list = [(seq, acc, use_rv, feature_names, 10000) for seq, acc in zip(sequences, accessions)]
+                args_list = [(seq, acc, feature_names, 10000) for seq, acc in zip(sequences, accessions)]
                 features_list = list(tqdm(
                     executor.map(extract_features_worker, args_list), 
                     desc="Extracting features", 

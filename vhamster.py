@@ -453,7 +453,6 @@ def _extract_features(
     chunked_seqs: List[str],
     chunked_accs: List[str],
     feature_names: List[str],
-    use_rv: bool,
     chunk_size: int,
     config: Dict,
 ) -> Tuple[List[List[float]], Optional[List[List[float]]]]:
@@ -461,7 +460,7 @@ def _extract_features(
     logger.info(f"{len(feature_names)} features x {len(chunked_seqs)} chunk(s)")
     n_workers = min(multiprocessing.cpu_count(), len(chunked_seqs), 8)
     args_list = [
-        (seq, acc, use_rv, feature_names, chunk_size)
+        (seq, acc, feature_names, chunk_size)
         for seq, acc in zip(chunked_seqs, chunked_accs)
     ]
     chunksize = max(1, len(chunked_seqs) // (n_workers * 4))
@@ -531,7 +530,7 @@ def _configure_logging(output_dir: pathlib.Path, prefix: str) -> pathlib.Path:
 def _run(args: Any) -> None:
 
     logger.info("=" * 68)
-    logger.info(f"V-HAMSTeR Ensemble Predictor v{__version__}")
+    logger.info(f"V-HAMSTeR v{__version__}")
     logger.info("Virus Host Assignment Model using Sequence Transformers and Reading-frame")
     logger.info("=" * 68)
 
@@ -606,7 +605,6 @@ def _run(args: Any) -> None:
             chunked_seqs=chunked_seqs,
             chunked_accs=chunked_accs,
             feature_names=feature_names,
-            use_rv=args.use_rv,
             chunk_size=args.chunk_size,
             config=ref_config,
         )
@@ -789,7 +787,7 @@ def _run(args: Any) -> None:
 @click.command(context_settings={"help_option_names": ["-h", "--help"]})
 @click.option("--fasta", type=click.Path(path_type=pathlib.Path, exists=True, dir_okay=False), required=True, help="Input FASTA file.")
 @click.option("--output", type=click.Path(path_type=pathlib.Path, file_okay=False), required=True, help="Output directory.")
-@click.option("--prefix", default="ensemble_predictions", show_default=True, help="Base filename prefix for outputs.")
+@click.option("--prefix", default="vhamster", show_default=True, help="Base filename prefix for outputs.")
 @click.option("--force", "force", is_flag=True, help="Overwrite output if it exists.")
 @click.option("--ensemble-dir", type=click.Path(path_type=pathlib.Path), default=_DEFAULT_MODEL_ROOT / "best_params_20260331", show_default=True, help="Root directory containing fold_* subdirs.")
 @click.option("--fold-dirs", type=click.Path(path_type=pathlib.Path), multiple=True, help="Explicit fold directories (overrides --ensemble-dir).")
@@ -799,7 +797,6 @@ def _run(args: Any) -> None:
 @click.option("--temperature-file", type=str, default=str(_DEFAULT_MODEL_ROOT / "joint_temperature.pt"), show_default=True, help="Temperature as scalar (e.g. 1.0) or path to saved T_joint file.")
 @click.option("--chunk-size", type=int, default=10000, show_default=True, help="Chunk length in bp.")
 @click.option("--overlap", type=int, default=1000, show_default=True, help="Overlap between chunks in bp.")
-@click.option("--use-rv", is_flag=True, help="Use RNA-virus gene caller for feature extraction.")
 @click.option("--batch-size", type=int, default=16, show_default=True, help="Inference batch size.")
 @click.option("--fp16", is_flag=True, help="Use FP16 mixed precision.")
 @click.option("--num-workers", type=int, default=4, show_default=True, help="DataLoader workers.")
@@ -818,7 +815,6 @@ def main(
     temperature_file: str,
     chunk_size: int,
     overlap: int,
-    use_rv: bool,
     batch_size: int,
     fp16: bool,
     num_workers: int,
@@ -843,7 +839,6 @@ def main(
         temperature_file=temperature_file,
         chunk_size=chunk_size,
         overlap=overlap,
-        use_rv=use_rv,
         batch_size=batch_size,
         fp16=fp16,
         num_workers=num_workers,
