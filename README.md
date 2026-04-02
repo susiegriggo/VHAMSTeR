@@ -9,19 +9,47 @@ It runs a 5-fold ensemble and writes:
 - genome-level consensus predictions (mean-pooled over chunks)
 
 **Default paths** (used automatically when no flags are given):
-- Model ensemble: `model/best_params_20260331`
-- Temperature file: `model/joint_temperature.pt`
+- Model ensemble: active environment `site-packages/vhamster_models/best_params_20260331`
+- Temperature file: active environment `site-packages/vhamster_models/joint_temperature.pt`
 
-> **Note:** Until the model is available for automatic download (e.g. from Zenodo), you need to
-> supply the model directory manually if it is not at the default location:
->
-> ```bash
-> vhamster \
->   --fasta input.fasta \
->   --output results/ \
->   --ensemble-dir /path/to/best_params_20260331 \
->   --temperature-file /path/to/joint_temperature.pt
-> ```
+## Model installation
+
+Model installation is a separate step after `pip install -e .`.
+
+Install the pretrained model bundle (v1.0.0) from NERSC:
+
+```bash
+vhamster-install-models
+```
+
+By default, this installs into an environment-scoped location in the active Python
+environment: `site-packages/vhamster_models`.
+
+If that default location is not writable, install to your own directory instead:
+
+```bash
+vhamster-install-models -o /path/to/my_vhamster_models
+```
+
+Reinstall if needed:
+
+```bash
+vhamster-install-models --force
+```
+
+The installer places files at:
+- `<install_root>/best_params_20260331`
+- `<install_root>/joint_temperature.pt`
+
+If your models are stored elsewhere, pass explicit paths when running inference:
+
+```bash
+vhamster \
+  --fasta input.fasta \
+  --output results/ \
+  --ensemble-dir /path/to/best_params_20260331 \
+  --temperature-file /path/to/joint_temperature.pt
+```
 
 ## Dependencies
 

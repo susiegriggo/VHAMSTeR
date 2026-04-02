@@ -28,6 +28,7 @@ import multiprocessing
 import pathlib
 import re
 import sys
+import sysconfig
 from types import SimpleNamespace
 from concurrent.futures import ProcessPoolExecutor
 from typing import Dict, List, Optional, Tuple, Any, Union
@@ -55,6 +56,16 @@ from src.models import GenomeClassifier, make_collate_fn
 from src.sequences import GenomeDataset, load_fasta_sequences
 
 # ── local helper functions (self-contained; no external calibration dependency) ─
+
+
+def _default_model_root() -> pathlib.Path:
+    purelib = sysconfig.get_path("purelib")
+    if purelib is None:
+        return _ROOT / "model"
+    return pathlib.Path(purelib) / "vhamster_models"
+
+
+_DEFAULT_MODEL_ROOT = _default_model_root()
 
 def _discover_fold_dirs(args: Any) -> List[pathlib.Path]:
     """Resolve fold directories from --fold-dirs or --ensemble-dir."""
@@ -780,12 +791,12 @@ def _run(args: Any) -> None:
 @click.option("--output", type=click.Path(path_type=pathlib.Path, file_okay=False), required=True, help="Output directory.")
 @click.option("--prefix", default="ensemble_predictions", show_default=True, help="Base filename prefix for outputs.")
 @click.option("--force", "force", is_flag=True, help="Overwrite output if it exists.")
-@click.option("--ensemble-dir", type=click.Path(path_type=pathlib.Path), default=_ROOT / "model" / "best_params_20260331", show_default=True, help="Root directory containing fold_* subdirs.")
+@click.option("--ensemble-dir", type=click.Path(path_type=pathlib.Path), default=_DEFAULT_MODEL_ROOT / "best_params_20260331", show_default=True, help="Root directory containing fold_* subdirs.")
 @click.option("--fold-dirs", type=click.Path(path_type=pathlib.Path), multiple=True, help="Explicit fold directories (overrides --ensemble-dir).")
 @click.option("--num-folds", type=int, default=5, show_default=True, help="Number of folds to use.")
 @click.option("--fold-index", type=int, default=None, help="Use only one fold by index, e.g. 0..4.")
 @click.option("--checkpoint-subdir", default="best_macro_f1_model", show_default=True, help="Checkpoint subdirectory name.")
-@click.option("--temperature-file", type=str, default=str(_ROOT / "model" / "joint_temperature.pt"), show_default=True, help="Temperature as scalar (e.g. 1.0) or path to saved T_joint file.")
+@click.option("--temperature-file", type=str, default=str(_DEFAULT_MODEL_ROOT / "joint_temperature.pt"), show_default=True, help="Temperature as scalar (e.g. 1.0) or path to saved T_joint file.")
 @click.option("--chunk-size", type=int, default=10000, show_default=True, help="Chunk length in bp.")
 @click.option("--overlap", type=int, default=1000, show_default=True, help="Overlap between chunks in bp.")
 @click.option("--use-rv", is_flag=True, help="Use RNA-virus gene caller for feature extraction.")

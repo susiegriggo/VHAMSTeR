@@ -6,19 +6,20 @@ channels:
   - defaults
 dependencies:
   - python=3.11
-  - pytorch
+  - pytorch=2.11
   - pytorch-cuda=12.1          # change to match your cluster's CUDA version
   - pip
   - pip:
-      - click
-      - loguru
-      - transformers
-      - peft
-      - numpy
-      - polars
-      - biopython
-      - pyrodigal-gv
-      - pyrodigal-rv
-      - tqdm
-      - scikit-learn
+      - click==8.3.1
+      - loguru==0.7.3
+      - transformers==5.4.0
+      - peft==0.18.1
+      - numpy==2.4.4
+      - polars==1.39.3
+      - biopython==1.87
+      - pyrodigal-gv==0.3.2
+      - pyrodigal-rv==0.1.0
+      - tqdm==4.67.3
+      - scikit-learn==1.8.0
+      - requests==2.33.1
       - -e .                   # installs vhamster itself in editable mode
