@@ -3,9 +3,9 @@
 V-HAMSTeR 
 ==============================================================
 Virus Host Assignment Model using Sequence Transformers and Reading-frame.
-Run inference using the full 5-fold deep ensemble and apply the joint
-temperature T_joint (from calibrate_joint_temperature.py) before converting
-logits to probabilities.
+Run inference using the full 5-fold deep ensemble and apply per-chunk
+length- and class-specific temperatures (from calibrate_length_aware.py)
+before converting logits to probabilities.
 
 Flow
 ----
@@ -13,14 +13,15 @@ Flow
 2. Read architecture / label / feature config from fold 0's config.json.
 3. Chunk input sequences and extract handcrafted features.
 4. For every fold model: load weights → run no-grad inference → get raw logits.
-5. Scale each fold's logits by T_joint, apply softmax, then average calibrated
-    probability distributions across folds.
+5. Average raw logits across folds, then apply per-chunk (predicted_class,
+    length) temperatures from the length-class calibration JSON and compute
+    final probabilities via softmax.
 6. Write chunk-level TSV output in the same format as predict_genome.py.
 7. Aggregate chunks from the same parent genome by mean-pooling calibrated
     class probabilities to produce genome-level consensus predictions.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 import gc
 import json
@@ -230,43 +231,49 @@ def _aggregate_chunks(
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _load_temperature(temperature_value: Optional[Union[str, pathlib.Path, float]]) -> float:
-    """Load temperature from either a numeric value or a saved .pt file.
+def _load_length_class_temperatures(
+    path: Optional[Union[str, pathlib.Path]],
+) -> Optional[Dict[int, Dict[int, float]]]:
+    """Load per-(class, length) temperatures from a JSON file produced by
+    calibrate_length_aware.py.
 
-    Accepted inputs:
-    - float/int-like string, e.g. "1.0", "2.35"
-    - pathlib.Path / path string to a torch-saved object with key T_joint or scalar
+    The JSON structure is ``{class_idx_str: {length_bin_str: temperature}}``.
+    Returns None if path is None or the file cannot be found.
     """
-    if temperature_value is None:
-        return 1.0
+    if path is None:
+        return None
+    p = pathlib.Path(str(path))
+    if not p.exists():
+        logger.warning(f"Length-class temperature file not found: {p}. Using T=1.0 (uncalibrated).")
+        return None
+    with open(p, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    result: Dict[int, Dict[int, float]] = {
+        int(cls_key): {int(lb): float(t) for lb, t in bins.items()}
+        for cls_key, bins in raw.items()
+    }
+    logger.info(f"Loaded length-class temperatures: {len(result)} class(es) from {p}")
+    return result
 
-    # Allow direct scalar input for quick benchmarking.
-    if isinstance(temperature_value, (int, float)):
-        t = float(temperature_value)
-        logger.info(f"Using temperature scalar T = {t:.8f} from CLI")
-        return t
 
-    value_str = str(temperature_value)
-    try:
-        t = float(value_str)
-        logger.info(f"Using temperature scalar T = {t:.8f} from CLI")
-        return t
-    except (TypeError, ValueError):
-        pass
-
-    # Fall back to path-based loading.
-    temperature_file = pathlib.Path(value_str)
-    if not temperature_file.exists():
-        logger.warning(f"Temperature file not found: {temperature_file}. Using T=1.0 (no calibration).")
-        return 1.0
-
-    state = torch.load(temperature_file, map_location="cpu")
-    if isinstance(state, dict):
-        t = float(state.get("T_joint", 1.0))
-    else:
-        t = float(state)
-    logger.info(f"Loaded T_joint = {t:.8f} from {temperature_file}")
-    return t
+def _get_length_class_temperature(
+    length_class_temps: Optional[Dict[int, Dict[int, float]]],
+    predicted_class: int,
+    chunk_length: int,
+    fallback: float = 1.0,
+) -> float:
+    """Return the calibrated temperature for a given predicted class and chunk
+    length.  Nearest-bin matching is used so that chunk lengths between
+    calibration grid points map to the closest available temperature.
+    """
+    if length_class_temps is None:
+        return fallback
+    class_temps = length_class_temps.get(predicted_class)
+    if not class_temps:
+        return fallback
+    bins = sorted(class_temps.keys())
+    nearest_bin = min(bins, key=lambda b: abs(b - chunk_length))
+    return class_temps[nearest_bin]
 
 
 def _normalise_label_mapping(mapping: Dict) -> Dict[int, str]:
@@ -579,12 +586,11 @@ def _run(args: Any) -> None:
     logger.info(f"Feature stream: {use_features} ({len(feature_names)} features)")
     logger.info(f"Integration mode: {feature_integration_mode}")
 
-    T_joint: float = _load_temperature(args.temperature_file)
-    logger.info(f"Temperature: {T_joint:.8f}")
-    if T_joint > 5.0:
-        logger.warning(
-            "Large temperature detected; probabilities may be very flat (close to uniform)."
-        )
+    length_class_temps = _load_length_class_temperatures(args.length_class_temperatures)
+    if length_class_temps is not None:
+        logger.info(f"Length-class temperatures loaded: {len(length_class_temps)} class(es)")
+    else:
+        logger.warning("No length-class temperature file found; using T=1.0 (uncalibrated).")
 
     # ── [2/5] Chunking ────────────────────────────────────────────────────────
     logger.info("[2/5] Loading and chunking sequences")
@@ -644,13 +650,12 @@ def _run(args: Any) -> None:
 
     dataloader = DataLoader(dataset, **dataloader_kwargs)
 
-    # Accumulate per-fold calibrated probabilities then average.
-    # Correct deep-ensemble aggregation: scale each fold's logits by T_joint,
-    # apply softmax to get that fold's probability distribution, then average
-    # the distributions.  Averaging raw logits before softmax would produce an
-    # artificially sharper distribution and is inconsistent with how T_joint
-    # was fitted (which scaled individual-fold logits during calibration).
-    accumulated_probs: Optional[torch.Tensor] = None
+    # Accumulate raw logits across folds, then average and apply per-chunk
+    # (predicted_class, length) temperatures from the length-class calibration.
+    # Averaging logits first and then applying a single per-chunk temperature is
+    # consistent with how calibrate_length_aware.py fitted temperatures against
+    # the ensemble's averaged logit predictions.
+    accumulated_logits: Optional[torch.Tensor] = None
 
     for fold_idx, fold_dir in enumerate(args.fold_dirs_resolved, start=1):
         logger.info(f"Fold {fold_idx}/{args.num_folds}: {fold_dir.name}")
@@ -659,23 +664,20 @@ def _run(args: Any) -> None:
         # Raw logits from this fold's model [N, C]
         fold_logits = _collect_logits(classifier, dataloader, device, args.fp16)
 
-        # Scale by T_joint and convert to probabilities before accumulating.
-        fold_probs = F.softmax(fold_logits / T_joint, dim=-1)  # [N, C]
-
-        # Align fold probabilities to reference class order by class name before
-        # averaging; protects against per-fold label index drift.
+        # Align fold logits to reference class order before accumulating;
+        # protects against per-fold label index drift.
         fold_label_mapping = _normalise_label_mapping(fold_config.get("label_mapping", {}))
-        fold_probs = _align_fold_probs_to_reference(
-            fold_probs=fold_probs,
+        fold_logits = _align_fold_probs_to_reference(
+            fold_probs=fold_logits,
             fold_label_mapping=fold_label_mapping,
             ref_label_mapping=label_mapping,
             fold_name=fold_dir.name,
         )
 
-        if accumulated_probs is None:
-            accumulated_probs = fold_probs
+        if accumulated_logits is None:
+            accumulated_logits = fold_logits.clone()
         else:
-            accumulated_probs += fold_probs
+            accumulated_logits = accumulated_logits + fold_logits
 
         # Free GPU memory before loading the next fold.
         del classifier
@@ -683,8 +685,19 @@ def _run(args: Any) -> None:
             torch.cuda.empty_cache()
         gc.collect()
 
-    # Average the probability distributions across folds.
-    calibrated_probs: np.ndarray = (accumulated_probs / args.num_folds).numpy()  # [N, C]
+    # Average logits across folds, then apply per-chunk length-class temperatures.
+    avg_logits = accumulated_logits / args.num_folds  # [N, C]
+    
+    chunk_lengths = [len(s) for s in chunked_seqs]
+    pred_classes_for_temp = avg_logits.argmax(dim=1).tolist()
+    temps_per_chunk = torch.tensor(
+        [
+            _get_length_class_temperature(length_class_temps, int(c), cl)
+            for c, cl in zip(pred_classes_for_temp, chunk_lengths)
+        ],
+        dtype=torch.float32,
+    ).unsqueeze(1)  # [N, 1] for broadcasting
+    calibrated_probs: np.ndarray = F.softmax(avg_logits / temps_per_chunk, dim=-1).numpy()  # [N, C]
 
     # The DataLoader uses shuffle=False, so accession order matches chunked_accs exactly.
     all_accessions = chunked_accs
@@ -766,7 +779,7 @@ def _run(args: Any) -> None:
     logger.info(f"Sequences processed: {len(accessions)}")
     logger.info(f"Chunks processed: {len(chunked_seqs)}")
     logger.info(f"Folds used: {args.num_folds}")
-    logger.info(f"Temperature (T): {T_joint:.6f}")
+    logger.info(f"Calibration: length-class temperatures ({args.length_class_temperatures})")
     logger.info(f"Chunk output: {args.output}")
     if prok_col_idx is not None:
         n_prok = sum(1 for h in predicted_hosts if "prokaryote" in h.lower())
@@ -794,7 +807,7 @@ def _run(args: Any) -> None:
 @click.option("--num-folds", type=int, default=5, show_default=True, help="Number of folds to use.")
 @click.option("--fold-index", type=int, default=None, help="Use only one fold by index, e.g. 0..4.")
 @click.option("--checkpoint-subdir", default="best_macro_f1_model", show_default=True, help="Checkpoint subdirectory name.")
-@click.option("--temperature-file", type=str, default=str(_DEFAULT_MODEL_ROOT / "joint_temperature.pt"), show_default=True, help="Temperature as scalar (e.g. 1.0) or path to saved T_joint file.")
+@click.option("--length-class-temperatures", type=str, default=str(_DEFAULT_MODEL_ROOT / "length_class_temperatures_continuous_brier.json"), show_default=True, help="Path to per-(class, length) temperature JSON produced by calibrate_length_aware.py.")
 @click.option("--chunk-size", type=int, default=10000, show_default=True, help="Chunk length in bp.")
 @click.option("--overlap", type=int, default=1000, show_default=True, help="Overlap between chunks in bp.")
 @click.option("--batch-size", type=int, default=16, show_default=True, help="Inference batch size.")
@@ -812,7 +825,7 @@ def main(
     num_folds: int,
     fold_index: Optional[int],
     checkpoint_subdir: str,
-    temperature_file: str,
+    length_class_temperatures: str,
     chunk_size: int,
     overlap: int,
     batch_size: int,
@@ -836,7 +849,7 @@ def main(
         num_folds=num_folds,
         fold_index=fold_index,
         checkpoint_subdir=checkpoint_subdir,
-        temperature_file=temperature_file,
+        length_class_temperatures=length_class_temperatures,
         chunk_size=chunk_size,
         overlap=overlap,
         batch_size=batch_size,
