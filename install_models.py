@@ -21,13 +21,13 @@ from loguru import logger
 import click
 
 
-# Model configuration for v1.0.0
+# Model configuration for v1.0.1
 VERSION_DICTIONARY = {
-    "1.0.0": {
+    "1.0.1": {
         "md5": None,  # Will be calculated or user can provide
-        "db_url": "https://portal.nersc.gov/cfs/m342/V-HAMSTeR/vhamster_models_v1.0.0.tar.gz",
-        "dir_name": "vhamster_models_v1.0.0",
-        "expected_structure": ["best_params_20260331", "joint_temperature.pt"],
+        "db_url": "https://portal.nersc.gov/cfs/m342/V-HAMSTeR/vhamster_models_v1.0.1.tar.gz",
+        "dir_name": "vhamster_models_v1.0.1",
+        "expected_structure": ["best_params_20260331", "length_class_temperatures_continuous_brier.json"],
     }
 }
 
@@ -40,7 +40,7 @@ REQUIRED_MODEL_FILES = [
 ]
 
 REQUIRED_ROOT_FILES = [
-    "joint_temperature.pt",
+    "length_class_temperatures_continuous_brier.json",
 ]
 
 DEFAULT_MODEL_DIRNAME = "vhamster_models"
@@ -65,7 +65,7 @@ def get_default_model_dir() -> str:
     return env_model_dir
 
 
-def instantiate_install(model_dir: str, force: bool = False, version: str = "1.0.0"):
+def instantiate_install(model_dir: str, force: bool = False, version: str = "1.0.1"):
     """
     Begin model install
 
@@ -112,7 +112,7 @@ def instantiate_dir(model_dir: str):
             sys.exit(1)
 
 
-def check_model_installation(model_dir: str, version: str = "1.0.0") -> bool:
+def check_model_installation(model_dir: str, version: str = "1.0.1") -> bool:
     """
     Check that all required models have been installed
 
@@ -157,32 +157,48 @@ def download(db_url: str, tarball_path: Path):
     Adapted from bakta db.py
     """
     try:
-        with tarball_path.open("wb") as fh_out, requests.get(
-            db_url, stream=True
-        ) as resp:
-            total_length = resp.headers.get("content-length")
-            if total_length is not None:  # content length header is set
-                total_length = int(total_length)
-                total_length_mb = total_length / (1024 * 1024)
-            else:
-                total_length_mb = 0
-            
-            downloaded = 0
-            logger.info(f"Downloading file, total size: {total_length_mb:.2f} MB")
-            
-            for data in resp.iter_content(chunk_size=1024 * 1024):
-                fh_out.write(data)
-                downloaded += len(data)
-                
+        with requests.get(db_url, stream=True, timeout=60) as resp:
+            if resp.status_code >= 400:
+                msg = (
+                    f"HTTP {resp.status_code} when downloading model bundle from {db_url}. "
+                    "This usually means the file is private or access is restricted."
+                )
+                logger.error(msg)
+                sys.exit(msg)
+
+            content_type = (resp.headers.get("content-type") or "").lower()
+            if "text/html" in content_type or "text/plain" in content_type:
+                msg = (
+                    f"URL returned content-type '{content_type}' instead of a tar.gz archive: {db_url}. "
+                    "Check the URL/version or NERSC access permissions."
+                )
+                logger.error(msg)
+                sys.exit(msg)
+
+            with tarball_path.open("wb") as fh_out:
+                total_length = resp.headers.get("content-length")
+                if total_length is not None:  # content length header is set
+                    total_length = int(total_length)
+                    total_length_mb = total_length / (1024 * 1024)
+                else:
+                    total_length_mb = 0
+
+                downloaded = 0
+                logger.info(f"Downloading file, total size: {total_length_mb:.2f} MB")
+
+                for data in resp.iter_content(chunk_size=1024 * 1024):
+                    fh_out.write(data)
+                    downloaded += len(data)
+
+                    if total_length is not None:
+                        percent = (downloaded / total_length) * 100
+                        downloaded_mb = downloaded / (1024 * 1024)
+                        sys.stdout.write(f"\rProgress: {percent:.1f}% ({downloaded_mb:.1f}/{total_length_mb:.1f} MB)")
+                        sys.stdout.flush()
+
                 if total_length is not None:
-                    percent = (downloaded / total_length) * 100
-                    downloaded_mb = downloaded / (1024 * 1024)
-                    sys.stdout.write(f"\rProgress: {percent:.1f}% ({downloaded_mb:.1f}/{total_length_mb:.1f} MB)")
+                    sys.stdout.write("\n")  # New line after progress tracking is complete
                     sys.stdout.flush()
-            
-            if total_length is not None:
-                sys.stdout.write("\n")  # New line after progress tracking is complete
-                sys.stdout.flush()
                 
     except IOError as e:
         logger.error(f"Could not download file from NERSC! url={db_url}, path={tarball_path}")
@@ -257,7 +273,7 @@ def inspect_tarball(tarball_path: Path):
         }
 
 
-def untar(tarball_path: Path, output_path: str, version: str = "1.0.0"):
+def untar(tarball_path: Path, output_path: str, version: str = "1.0.1"):
     """
     Extract tarball and organize files into the expected directory structure
     """
@@ -292,6 +308,7 @@ def untar(tarball_path: Path, output_path: str, version: str = "1.0.0"):
         os.makedirs(temp_extract_dir, exist_ok=True)
         
         # Extract the tarball to temp directory first
+        logger.info("Extraction may take several minutes; please be patient!")
         logger.info(f"Extracting tarball to temporary directory: {temp_extract_dir}")
         with tarfile.open(tarball_path, 'r:gz') as tar:
             all_members = tar.getmembers()
@@ -316,7 +333,7 @@ def untar(tarball_path: Path, output_path: str, version: str = "1.0.0"):
         extracted_items = os.listdir(temp_extract_dir)
         logger.info(f"Extracted items: {extracted_items}")
         
-        # Look for the vhamster_models_v1.0.0 directory
+        # Look for the expected extracted model directory for this version
         source_prefix = VERSION_DICTIONARY[version]["dir_name"]
         source_path = os.path.join(temp_extract_dir, source_prefix)
         
@@ -328,12 +345,12 @@ def untar(tarball_path: Path, output_path: str, version: str = "1.0.0"):
         
         logger.info(f"Found source directory: {source_path}")
         
-        # Move best_params_20260331 and joint_temperature.pt into output_path
+        # Move best_params_20260331 and the calibration JSON into output_path
         source_ensemble = os.path.join(source_path, "best_params_20260331")
-        source_temperature = os.path.join(source_path, "joint_temperature.pt")
+        source_temperature = os.path.join(source_path, "length_class_temperatures_continuous_brier.json")
         
         dest_ensemble = os.path.join(output_path, "best_params_20260331")
-        dest_temperature = os.path.join(output_path, "joint_temperature.pt")
+        dest_temperature = os.path.join(output_path, "length_class_temperatures_continuous_brier.json")
         
         # Handle best_params_20260331
         if os.path.exists(source_ensemble):
@@ -349,7 +366,7 @@ def untar(tarball_path: Path, output_path: str, version: str = "1.0.0"):
             remove_directory(temp_extract_dir)
             sys.exit("Ensemble directory 'best_params_20260331' not found in tarball")
         
-        # Handle joint_temperature.pt
+        # Handle calibration JSON
         if os.path.exists(source_temperature):
             if os.path.exists(dest_temperature):
                 logger.info(f"Overwriting existing temperature file: {dest_temperature}")
@@ -382,7 +399,7 @@ def untar(tarball_path: Path, output_path: str, version: str = "1.0.0"):
         sys.exit(f"Extraction error: {e}")
 
 
-def get_models_nersc(model_dir: str, version: str = "1.0.0"):
+def get_models_nersc(model_dir: str, version: str = "1.0.1"):
     """
     Download vHAMSTeR models from NERSC portal
     
@@ -422,10 +439,10 @@ def get_models_nersc(model_dir: str, version: str = "1.0.0"):
         fold_dirs = [d for d in os.listdir(ensemble_dir) if d.startswith("fold_")]
         logger.info(f"Installed {len(fold_dirs)} fold models: {sorted(fold_dirs)}")
     
-    temperature_file = os.path.join(model_dir, "joint_temperature.pt")
+    temperature_file = os.path.join(model_dir, "length_class_temperatures_continuous_brier.json")
     if os.path.exists(temperature_file):
         file_size = os.path.getsize(temperature_file) / (1024 * 1024)
-        logger.info(f"Temperature calibration file installed ({file_size:.2f} MB)")
+        logger.info(f"Length-class calibration file installed ({file_size:.2f} MB)")
     
     logger.info("Installation completed successfully!")
 
@@ -449,7 +466,7 @@ def get_models_nersc(model_dir: str, version: str = "1.0.0"):
     "-v",
     "--version",
     type=str,
-    default="1.0.0",
+    default="1.0.1",
     show_default=True,
     help="Version of vHAMSTeR models to install",
 )
@@ -497,7 +514,7 @@ def main(outdir, force, version, debug):
     else:
         logger.warning(f"✗ Ensemble directory not found: {ensemble_dir}")
     
-    temperature_file = os.path.join(model_dir, "joint_temperature.pt")
+    temperature_file = os.path.join(model_dir, "length_class_temperatures_continuous_brier.json")
     if os.path.exists(temperature_file):
         logger.info(f"✓ Temperature file: {temperature_file}")
     else:

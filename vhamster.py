@@ -21,7 +21,7 @@ Flow
     class probabilities to produce genome-level consensus predictions.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 import gc
 import json
@@ -687,6 +687,7 @@ def _run(args: Any) -> None:
 
     # Average logits across folds, then apply per-chunk length-class temperatures.
     avg_logits = accumulated_logits / args.num_folds  # [N, C]
+    
     chunk_lengths = [len(s) for s in chunked_seqs]
     pred_classes_for_temp = avg_logits.argmax(dim=1).tolist()
     temps_per_chunk = torch.tensor(
@@ -806,7 +807,7 @@ def _run(args: Any) -> None:
 @click.option("--num-folds", type=int, default=5, show_default=True, help="Number of folds to use.")
 @click.option("--fold-index", type=int, default=None, help="Use only one fold by index, e.g. 0..4.")
 @click.option("--checkpoint-subdir", default="best_macro_f1_model", show_default=True, help="Checkpoint subdirectory name.")
-@click.option("--length-class-temperatures", type=str, default=str(_DEFAULT_MODEL_ROOT / "length_class_temperatures.json"), show_default=True, help="Path to per-(class, length) temperature JSON produced by calibrate_length_aware.py.")
+@click.option("--length-class-temperatures", type=str, default=str(_DEFAULT_MODEL_ROOT / "length_class_temperatures_continuous_brier.json"), show_default=True, help="Path to per-(class, length) temperature JSON produced by calibrate_length_aware.py.")
 @click.option("--chunk-size", type=int, default=10000, show_default=True, help="Chunk length in bp.")
 @click.option("--overlap", type=int, default=1000, show_default=True, help="Overlap between chunks in bp.")
 @click.option("--batch-size", type=int, default=16, show_default=True, help="Inference batch size.")
