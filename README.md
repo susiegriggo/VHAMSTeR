@@ -1,4 +1,6 @@
-# V-HAMSTeR
+# VHAMSTeR
+![](vhamsterlogo.png)
+
 
 **V**irus **H**ost **A**ssignment **M**odel using **S**equence **T**ransformers and **R**eading-frames
 
