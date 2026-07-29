@@ -21,8 +21,7 @@ import subprocess
 import sys
 import tempfile
 from typing import Any, Dict, List, Tuple
-
-import pandas as pd
+import polars as pl
 import pyrodigal_gv
 from Bio import SeqIO
 
@@ -37,7 +36,7 @@ def load_viral_marker_metadata(metadata_tsv: pathlib.Path) -> Tuple[set, Dict[st
       1. a set of VV marker IDs
       2. a metadata mapping keyed by marker ID for viral-only markers
     """
-    df = pd.read_csv(metadata_tsv, sep="\t", low_memory=False)
+    df = pl.read_csv(metadata_tsv, separator="\t", null_values=["", "NA", "na", "NaN", "nan"], infer_schema_length=0)
     df.columns = [c.strip().lower() for c in df.columns]
 
     if "marker" not in df.columns:
@@ -51,14 +50,14 @@ def load_viral_marker_metadata(metadata_tsv: pathlib.Path) -> Tuple[set, Dict[st
             f"Found columns: {list(df.columns)}"
         )
 
-    viral_df = df[df["specificity_class"].str.upper() == "VV"]
-    whitelist = set(viral_df["marker"].astype(str).tolist())
+    viral_df = df.filter(pl.col("specificity_class").str.to_uppercase() == "VV")
+    whitelist = set(viral_df["marker"].cast(pl.Utf8).to_list())
     metadata_by_marker = {
         str(row["marker"]): {
-            str(col): ("" if pd.isna(value) else str(value))
-            for col, value in row.items()
+            str(col): ("" if row[col] is None else str(row[col]))
+            for col in viral_df.columns
         }
-        for row in viral_df.to_dict(orient="records")
+        for row in viral_df.iter_rows(named=True)
     }
     print(f"[genomad] Loaded {len(whitelist):,} viral-only (VV) markers from {metadata_tsv}")
     return whitelist, metadata_by_marker
@@ -392,7 +391,7 @@ def extract_genomad_markers(
 
         run_mmseqs_search(
             query_fasta=protein_fasta,
-            target_db=genomad_db,
+            target_db=genomad_db / "genomad_db",
             result_tsv=result_tsv,
             tmp_dir=mmseqs_tmp,
             threads=threads,
@@ -419,9 +418,9 @@ def write_annotation_rows(annotation_rows: List[Dict[str, str]], output_tsv: pat
     """Write per-hit annotations to TSV, including amino-acid sequences and marker metadata."""
     output_tsv.parent.mkdir(parents=True, exist_ok=True)
     if annotation_rows:
-        pd.DataFrame(annotation_rows).to_csv(output_tsv, sep="\t", index=False)
+        pl.DataFrame(annotation_rows).to_csv(output_tsv, separator="\t", index=False)
     else:
-        pd.DataFrame(
+        pl.DataFrame(
             columns=[
                 "parent_seq_id",
                 "protein_id",
@@ -448,7 +447,7 @@ def write_annotation_rows(annotation_rows: List[Dict[str, str]], output_tsv: pat
                 "query_coverage",
                 "target_coverage",
             ]
-        ).to_csv(output_tsv, sep="\t", index=False)
+        ).to_csv(output_tsv, separator="\t", index=False)
     print(f"[genomad] Saved hit annotations to {output_tsv}")
 
 
