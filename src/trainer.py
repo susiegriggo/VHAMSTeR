@@ -6,17 +6,17 @@ Docstring for trainer
 # imports
 from torch.utils.data import DataLoader
 import torch  
-from sklearn.metrics import accuracy_score, f1_score
+from sklearn.metrics import accuracy_score, f1_score, average_precision_score
+from sklearn.preprocessing import label_binarize
 from torch import nn
+import torch.nn.functional as F
 from tqdm.auto import tqdm
 from typing import Tuple, List, Optional, Dict
-try:
-    from .models import FocalLoss, ClassBalancedLoss
-except ImportError:
-    from models import FocalLoss, ClassBalancedLoss
+from models import FocalLoss, ClassBalancedLoss
 from huggingface_hub import snapshot_download
 import pandas as pd
 import optuna
+import time
 import json
 import shutil
 from pathlib import Path
@@ -29,6 +29,49 @@ try:
     AMP_AVAILABLE = True
 except ImportError:
     AMP_AVAILABLE = False
+
+
+def _nll_loss_from_log_probs(
+    log_probs: torch.Tensor,
+    labels: torch.Tensor,
+    use_focal_loss: bool = False,
+    focal_gamma: float = 2.0,
+    use_class_balanced_loss: bool = False,
+    samples_per_class=None,
+    cb_beta: float = 0.9999,
+    weights: torch.Tensor = None,
+) -> torch.Tensor:
+    """Compute loss from log-probabilities without applying log_softmax again.
+
+    The combined dual-stream output is a log-probability mixture distribution.
+    Standard CrossEntropyLoss would apply log_softmax a second time, corrupting
+    the gradients.  This function computes the correct NLL / focal-NLL /
+    class-balanced-NLL directly from log-probs.
+    """
+    # Per-sample log-probability and probability for the target class
+    log_pt = log_probs.gather(1, labels.unsqueeze(-1)).squeeze(-1)  # [B]
+    pt = log_pt.exp()  # [B]  (actual mixture probability of the target class)
+
+    if use_class_balanced_loss and samples_per_class is not None:
+        n = np.array(samples_per_class, dtype=np.float64)
+        effective_num = 1.0 - np.power(cb_beta, n)
+        cb_w = (1.0 - cb_beta) / effective_num
+        cb_w = cb_w / cb_w.sum() * len(cb_w)
+        cb_w = torch.tensor(cb_w, dtype=torch.float32, device=log_probs.device)
+        class_w = cb_w[labels]  # [B]
+        if use_focal_loss:
+            loss = -(class_w * (1 - pt) ** focal_gamma * log_pt).mean()
+        else:
+            loss = -(class_w * log_pt).mean()
+    elif use_focal_loss:
+        focal_w = (1 - pt) ** focal_gamma
+        if weights is not None:
+            focal_w = focal_w * weights[labels]
+        loss = -(focal_w * log_pt).mean()
+    else:
+        loss = F.nll_loss(log_probs, labels, weight=weights)
+
+    return loss
 
 def train_epoch(
     model: nn.Module,
@@ -49,6 +92,8 @@ def train_epoch(
     use_auxiliary_loss: bool = False,
     auxiliary_loss_weight: float = 0.3,
     use_learnable_aux_loss: bool = False,
+    prokaryote_idx: int = 2,
+    coarse_aux_weight: float = 0.2,
 ) -> float:
     """Train for one epoch."""
     model.train()
@@ -87,11 +132,17 @@ def train_epoch(
         features = batch.get('features')
         if features is not None:
             features = features.to(device)
-        
+        raw_features = batch.get('raw_features')
+        if raw_features is not None:
+            raw_features = raw_features.to(device)
+        marker_indices = batch.get('marker_indices')
+        if marker_indices is not None:
+            marker_indices = marker_indices.to(device)
+
         # Forward pass + loss computation (shared between FP16 and FP32 paths)
         def compute_forward_and_loss():
             nonlocal total_glm_loss, total_feat_loss
-            fwd_kwargs = dict(features=features)
+            fwd_kwargs = dict(features=features, raw_features=raw_features, marker_indices=marker_indices)
             if input_ids is not None:
                 fwd_kwargs['input_ids'] = input_ids.to(device)
                 fwd_kwargs['attention_mask'] = attention_mask.to(device) if attention_mask is not None else None
@@ -101,11 +152,24 @@ def train_epoch(
             if chunk_loss_averaging:
                 _logits, _loss = model(**fwd_kwargs, labels=labels)
             elif use_auxiliary_loss:
-                combined, glm_log, feat_log, log_vars = model(
-                    **fwd_kwargs, return_auxiliary_logits=True
-                )
+                aux_outputs = model(**fwd_kwargs, return_auxiliary_logits=True)
+                if len(aux_outputs) == 4:
+                    # dual_stream without coarse head: (combined, glm, feat, log_vars)
+                    combined, glm_log, feat_log, log_vars = aux_outputs
+                    coarse_log = None
+                elif len(aux_outputs) == 5:
+                    # hierarchical dual_stream with coarse head: (combined, glm, feat, coarse, log_vars)
+                    combined, glm_log, feat_log, coarse_log, log_vars = aux_outputs
+                else:
+                    raise ValueError(f"Unexpected number of auxiliary outputs: {len(aux_outputs)}")
                 if use_learnable_aux_loss and log_vars is not None:
-                    l_main = criterion(combined, labels)
+                    l_main = _nll_loss_from_log_probs(
+                        combined, labels,
+                        use_focal_loss=use_focal_loss, focal_gamma=focal_gamma,
+                        use_class_balanced_loss=use_class_balanced_loss,
+                        samples_per_class=samples_per_class, cb_beta=cb_beta,
+                        weights=weights.to(device) if weights is not None else None,
+                    )
                     prec_main = torch.exp(-log_vars[0])
                     _loss = (prec_main * l_main) + log_vars[0]
                     if glm_log is not None:
@@ -114,24 +178,74 @@ def train_epoch(
                         _loss += (prec_glm * l_glm) + log_vars[1]
                         total_glm_loss += l_glm.item()
                     if feat_log is not None:
-                        l_feat = criterion(feat_log, labels)
+                        l_feat = _nll_loss_from_log_probs(
+                            feat_log, labels,
+                            use_focal_loss=use_focal_loss, focal_gamma=focal_gamma,
+                            use_class_balanced_loss=use_class_balanced_loss,
+                            samples_per_class=samples_per_class, cb_beta=cb_beta,
+                            weights=weights.to(device) if weights is not None else None,
+                        )
                         prec_feat = torch.exp(-log_vars[2])
                         _loss += (prec_feat * l_feat) + log_vars[2]
                         total_feat_loss += l_feat.item()
+                    if coarse_log is not None:
+                        coarse_labels = (labels != prokaryote_idx).long()
+                        # Plain CE — coarse head is a balanced binary task; the 5-class
+                        # criterion (CB/focal with 5-class weights) would crash or give
+                        # wrong per-class weights when applied to binary [B, 2] logits.
+                        l_coarse = F.cross_entropy(coarse_log, coarse_labels)
+                        _loss = _loss + coarse_aux_weight * l_coarse
                 else:
-                    _loss = criterion(combined, labels)
+                    _loss = _nll_loss_from_log_probs(
+                        combined, labels,
+                        use_focal_loss=use_focal_loss, focal_gamma=focal_gamma,
+                        use_class_balanced_loss=use_class_balanced_loss,
+                        samples_per_class=samples_per_class, cb_beta=cb_beta,
+                        weights=weights.to(device) if weights is not None else None,
+                    )
                     if glm_log is not None:
                         l_glm = criterion(glm_log, labels)
                         _loss = _loss + auxiliary_loss_weight * l_glm
                         total_glm_loss += l_glm.item()
                     if feat_log is not None:
-                        l_feat = criterion(feat_log, labels)
+                        l_feat = _nll_loss_from_log_probs(
+                            feat_log, labels,
+                            use_focal_loss=use_focal_loss, focal_gamma=focal_gamma,
+                            use_class_balanced_loss=use_class_balanced_loss,
+                            samples_per_class=samples_per_class, cb_beta=cb_beta,
+                            weights=weights.to(device) if weights is not None else None,
+                        )
                         _loss = _loss + auxiliary_loss_weight * l_feat
                         total_feat_loss += l_feat.item()
+                    if coarse_log is not None:
+                        coarse_labels = (labels != prokaryote_idx).long()
+                        # Plain CE — coarse head is a balanced binary task; the 5-class
+                        # criterion (CB/focal with 5-class weights) would crash or give
+                        # wrong per-class weights when applied to binary [B, 2] logits.
+                        l_coarse = F.cross_entropy(coarse_log, coarse_labels)
+                        _loss = _loss + coarse_aux_weight * l_coarse
                 _logits = combined
             else:
                 _logits = model(**fwd_kwargs)
-                _loss = criterion(_logits, labels)
+                # GenomeClassifier always outputs log-probabilities; using
+                # CrossEntropyLoss (which applies log_softmax internally) would
+                # double-log them.  Detect the dual-stream case and use NLLLoss.
+                _is_dual = (
+                    hasattr(model, 'feature_integration_mode')
+                    and model.feature_integration_mode in [
+                        "dual_stream", "dual_stream_dynamic_gate", "stacking"
+                    ]
+                )
+                if _is_dual:
+                    _loss = _nll_loss_from_log_probs(
+                        _logits, labels,
+                        use_focal_loss=use_focal_loss, focal_gamma=focal_gamma,
+                        use_class_balanced_loss=use_class_balanced_loss,
+                        samples_per_class=samples_per_class, cb_beta=cb_beta,
+                        weights=weights.to(device) if weights is not None else None,
+                    )
+                else:
+                    _loss = criterion(_logits, labels)
             return _logits, _loss
         
         # FP16 vs FP32 path differs only in autocast wrapper and scaler usage
@@ -197,6 +311,8 @@ def evaluate(
     use_class_balanced_loss: bool = False,
     samples_per_class: list = None,
     cb_beta: float = 0.9999,
+    compute_auprc: bool = True,
+    prokaryote_idx: int = 2,
 ) -> Tuple[float, float, float, float, List[int], List[int], List[str], List[List[float]], Optional[float], Optional[float]]:
     """Evaluate model on validation set."""
     model.eval()
@@ -228,8 +344,10 @@ def evaluate(
     
     all_glm_preds = []
     all_feat_preds = []
-    is_dual_stream = hasattr(model, 'feature_integration_mode') and model.feature_integration_mode in ["dual_stream", "dual_stream_dynamic_gate"]
-    
+    all_coarse_preds = []
+    all_coarse_labels_bin = []
+    is_dual_stream = hasattr(model, 'feature_integration_mode') and model.feature_integration_mode in ["dual_stream", "dual_stream_dynamic_gate", "stacking"]
+
     with torch.no_grad():
         for batch in pbar:
             # Accept either pre-tokenized (input_ids) or raw sequences
@@ -241,26 +359,40 @@ def evaluate(
             features = batch.get('features')
             if features is not None:
                 features = features.to(device)
-            
-            fwd_kwargs = dict(features=features)
+            raw_features = batch.get('raw_features')
+            if raw_features is not None:
+                raw_features = raw_features.to(device)
+            marker_indices = batch.get('marker_indices')
+            if marker_indices is not None:
+                marker_indices = marker_indices.to(device)
+
+            fwd_kwargs = dict(features=features, raw_features=raw_features, marker_indices=marker_indices)
             if input_ids is not None:
                 fwd_kwargs['input_ids'] = input_ids.to(device)
                 fwd_kwargs['attention_mask'] = attention_mask.to(device) if attention_mask is not None else None
             else:
                 fwd_kwargs['sequences'] = sequences
-            
+
             if is_dual_stream:
-                logits, glm_logits, feat_logits, _ = model(
-                    **fwd_kwargs, return_auxiliary_logits=True
-                )
+                aux = model(**fwd_kwargs, return_auxiliary_logits=True)
+                if len(aux) == 4:
+                    logits, glm_logits, feat_logits, _ = aux
+                    coarse_logits = None
+                else:  # 5-tuple: coarse head present
+                    logits, glm_logits, feat_logits, coarse_logits, _ = aux
                 if glm_logits is not None:
                     all_glm_preds.extend(torch.argmax(glm_logits, dim=-1).cpu().numpy())
                 if feat_logits is not None:
                     all_feat_preds.extend(torch.argmax(feat_logits, dim=-1).cpu().numpy())
+                if coarse_logits is not None:
+                    all_coarse_preds.extend(torch.argmax(coarse_logits, dim=-1).cpu().numpy())
+                    all_coarse_labels_bin.extend(
+                        (labels != prokaryote_idx).long().cpu().numpy()
+                    )
             else:
                 logits = model(**fwd_kwargs)
 
-            # If the model has a dynamic gate, extract alpha values safely across scalar/array types.
+            # Extract gate alpha (sigmoid scalar per sample)
             if hasattr(model, "_last_alpha_batch") and model._last_alpha_batch is not None:
                 batch_alphas = model._last_alpha_batch
                 if isinstance(batch_alphas, (int, float)):
@@ -272,12 +404,21 @@ def evaluate(
                     else:
                         all_alphas.append(float(alphas_list))
                 elif isinstance(batch_alphas, (list, tuple)):
-                    all_alphas.extend([float(alpha) for alpha in batch_alphas])
+                    all_alphas.extend([float(a) for a in batch_alphas])
             
-            loss = criterion(logits, labels)
+            if is_dual_stream:
+                loss = _nll_loss_from_log_probs(
+                    logits, labels,
+                    use_focal_loss=use_focal_loss, focal_gamma=focal_gamma,
+                    use_class_balanced_loss=use_class_balanced_loss,
+                    samples_per_class=samples_per_class, cb_beta=cb_beta,
+                    weights=weights.to(device) if weights is not None else None,
+                )
+            else:
+                loss = criterion(logits, labels)
             total_loss += loss.item()
             
-            probs = torch.softmax(logits, dim=-1)
+            probs = torch.exp(logits) if is_dual_stream else torch.softmax(logits, dim=-1)
             all_probs.extend(probs.cpu().numpy())
             
             preds = torch.argmax(logits, dim=-1)
@@ -294,15 +435,39 @@ def evaluate(
     weighted_f1 = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
     per_class_f1 = f1_score(all_labels, all_preds, average=None, zero_division=0)
     min_class_f1 = float(per_class_f1.min()) if len(per_class_f1) > 0 else 0.0
-    
+
+    all_probs_np = np.array(all_probs)
+    n_classes = all_probs_np.shape[1]
+    if compute_auprc:
+        val_true_bin = label_binarize(all_labels, classes=list(range(n_classes)))
+        if val_true_bin.shape[1] == 1:  # binary edge case
+            val_true_bin = np.hstack((1 - val_true_bin, val_true_bin))
+        # Only score classes that are actually present — per-clade holdout loaders
+        # contain a single family, leaving most columns all-zero and causing
+        # "No positive class found" warnings and inflated AUPRC values.
+        present_classes = sorted(set(all_labels))
+        if len(present_classes) >= 2:
+            macro_auprc = average_precision_score(
+                val_true_bin[:, present_classes],
+                all_probs_np[:, present_classes],
+                average='macro',
+            )
+        else:
+            macro_auprc = 0.0
+    else:
+        macro_auprc = 0.0
+
     glm_accuracy = None
-    feat_accuracy = None
+    xgb_accuracy = None
+    coarse_accuracy = None
     if all_glm_preds:
         glm_accuracy = accuracy_score(all_labels, all_glm_preds)
     if all_feat_preds:
-        feat_accuracy = accuracy_score(all_labels, all_feat_preds)
-    
-    return avg_loss, accuracy, macro_f1, weighted_f1, min_class_f1, all_preds, all_labels, all_accessions, all_probs, glm_accuracy, feat_accuracy, all_alphas
+        xgb_accuracy = accuracy_score(all_labels, all_feat_preds)
+    if all_coarse_preds:
+        coarse_accuracy = accuracy_score(all_coarse_labels_bin, all_coarse_preds)
+
+    return avg_loss, accuracy, macro_f1, macro_auprc, weighted_f1, min_class_f1, all_preds, all_labels, all_accessions, all_probs, glm_accuracy, xgb_accuracy, all_alphas, coarse_accuracy
 
 def train_model(
     optimizer,
@@ -328,7 +493,7 @@ def train_model(
     resume_history: dict = None,
     resume_best_val_acc: float = 0.0,
     resume_best_val_loss: float = float('inf'),
-    resume_best_macro_f1: float = 0.0,
+    resume_best_macro_auprc: float = 0.0,
     resume_best_worst_holdout_acc: float = 0.0,
     resume_best_min_class_f1: float = 0.0,
     resume_patience_counter: int = 0,
@@ -337,6 +502,8 @@ def train_model(
     use_learnable_aux_loss: bool = False,
     challenge_loaders: Optional[Dict[str, DataLoader]] = None,
     trial=None,
+    prokaryote_idx: int = 2,
+    coarse_aux_weight: float = 0.2,
 ) -> Tuple[nn.Module, dict]:
     """Main training loop."""
     print("\n" + "="*80)
@@ -348,7 +515,7 @@ def train_model(
 
     best_val_acc = resume_best_val_acc
     best_val_loss = resume_best_val_loss
-    best_macro_f1 = resume_best_macro_f1
+    best_macro_auprc = resume_best_macro_auprc
     best_worst_holdout_acc = resume_best_worst_holdout_acc
     best_min_class_f1_for_stopping = resume_best_min_class_f1
     patience_counter = resume_patience_counter
@@ -361,11 +528,18 @@ def train_model(
             'val_loss': [],
             'val_accuracy': [],
             'val_macro_f1': [],
+            'val_macro_auprc': [],
             'val_weighted_f1': [],
             'val_worst_holdout_acc': [],
         }
 
     for epoch in range(start_epoch, epochs + 1):
+
+        # per epoch tracking
+        epoch_start_time = time.time()
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats(device)
+
         print(f"\n{'='*80}")
         print(f"Epoch {epoch}/{args.epochs}")
         print(f"{'='*80}")
@@ -385,7 +559,20 @@ def train_model(
             use_auxiliary_loss=use_auxiliary_loss,
             auxiliary_loss_weight=auxiliary_loss_weight,
             use_learnable_aux_loss=use_learnable_aux_loss,
+            prokaryote_idx=prokaryote_idx,
+            coarse_aux_weight=coarse_aux_weight,
         )
+
+        # report on the epoch stats 
+        epoch_duration = time.time() - epoch_start_time
+        epoch_peak_vram = 0 
+        if torch.cuda.is_available():
+            epoch_peak_vram = torch.cuda.max_memory_allocated(device) / (1024 ** 3)  # in GB
+
+        # append to history 
+        history.setdefault('epoch_times', []).append(epoch_duration)
+        history.setdefault('epoch_peak_vram', []).append(epoch_peak_vram)
+        
         history['train_loss'].append(train_loss)
         if use_auxiliary_loss:
             #history['train_glm_loss'].append(train_glm_loss)
@@ -410,14 +597,18 @@ def train_model(
         else:
             print(f"Epoch {epoch} - Sampler does not support get_category_counts().")
         
-        val_loss, val_acc, macro_f1, weighted_f1, min_class_f1, val_preds, val_true, val_accs_list, val_probs, glm_acc, feat_acc, val_alphas = evaluate(
+        val_loss, val_acc, macro_f1, macro_auprc, weighted_f1, min_class_f1, val_preds, val_true, val_accs_list, val_probs, glm_acc, xgb_acc, val_alphas, coarse_acc = evaluate(
             model, dataloader=val_loader, device=device, epoch=epoch, weights=weights, use_focal_loss=use_focal_loss, focal_gamma=focal_loss_gamma,
-            use_class_balanced_loss=use_class_balanced_loss, samples_per_class=samples_per_class, cb_beta=cb_beta
+            use_class_balanced_loss=use_class_balanced_loss, samples_per_class=samples_per_class, cb_beta=cb_beta,
+            prokaryote_idx=prokaryote_idx,
         )
         
         history['val_loss'].append(val_loss)
         history['val_accuracy'].append(val_acc)
-        history['val_macro_f1'].append(macro_f1)      
+        history['val_macro_f1'].append(macro_f1)
+        if 'val_macro_auprc' not in history:
+            history['val_macro_auprc'] = []
+        history['val_macro_auprc'].append(macro_auprc)
         history['val_weighted_f1'].append(weighted_f1)
         if 'val_min_class_f1' not in history:
             history['val_min_class_f1'] = []
@@ -429,7 +620,7 @@ def train_model(
         if challenge_loaders:
             print("\n  Holdout Family Evaluation:")
             for family_name, c_loader in challenge_loaders.items():
-                _, c_acc, _, _, _, _, _, _, _, _, _, _ = evaluate(
+                _, c_acc, _, _, _, _, _, _, _, _, _, _, _, _ = evaluate(
                     model,
                     dataloader=c_loader,
                     device=device,
@@ -440,6 +631,8 @@ def train_model(
                     use_class_balanced_loss=use_class_balanced_loss,
                     samples_per_class=samples_per_class,
                     cb_beta=cb_beta,
+                    compute_auprc=False,
+                    prokaryote_idx=prokaryote_idx,
                 )
                 challenge_accuracies[family_name] = c_acc
                 print(f"    - {family_name}: {c_acc:.4f}")
@@ -448,11 +641,10 @@ def train_model(
                 epoch_worst_challenge_acc = min(challenge_accuracies.values())
                 acc_values = [float(acc) for acc in challenge_accuracies.values() if acc is not None]
                 if acc_values:
-                    # Safe harmonic mean for holdout robustness aggregation.
-                    if any(acc <= 0.0 for acc in acc_values):
-                        epoch_holdout_hmean_acc = 0.0
-                    else:
-                        epoch_holdout_hmean_acc = len(acc_values) / sum(1.0 / acc for acc in acc_values)
+                    # Smoothed harmonic mean to prevent a single 0.0 from flatlining the gradient
+                    smoothed_accs = [acc + 0.01 for acc in acc_values]
+                    hmean = len(smoothed_accs) / sum(1.0 / acc for acc in smoothed_accs)
+                    epoch_holdout_hmean_acc = max(0.0, hmean - 0.01)
                 print(f"    -> Worst-Case Holdout Acc: {epoch_worst_challenge_acc:.4f}")
                 if epoch_holdout_hmean_acc is not None:
                     print(f"    -> Harmonic-Mean Holdout Acc: {epoch_holdout_hmean_acc:.4f}")
@@ -475,14 +667,10 @@ def train_model(
         if 'val_holdout_hmean_acc' in history:
             history['val_holdout_hmean_acc'].append(epoch_holdout_hmean_acc)
         
-        # --- Stream weight: use full-epoch mean for dynamic gate, scalar param for static ---
+        # --- Stream weight: mean alpha from dynamic gate ---
         epoch_stream_weight = None
-        
-        # Scenario A: Dynamic Gate (use the full list of alphas collected during evaluate)
         if val_alphas and len(val_alphas) > 0:
             epoch_stream_weight = sum(val_alphas) / len(val_alphas)
-            
-        # Scenario B: Static Gate (use the global parameter)
         elif hasattr(model, 'get_stream_weight'):
             epoch_stream_weight = model.get_stream_weight()
 
@@ -498,10 +686,10 @@ def train_model(
             if 'glm_accuracy' not in history:
                 history['glm_accuracy'] = []
             history['glm_accuracy'].append(glm_acc)
-        if feat_acc is not None:
-            if 'feature_accuracy' not in history:
-                history['feature_accuracy'] = []
-            history['feature_accuracy'].append(feat_acc)
+        if xgb_acc is not None:
+            if 'xgb_accuracy' not in history:
+                history['xgb_accuracy'] = []
+            history['xgb_accuracy'].append(xgb_acc)
         
         print(f"\nEpoch {epoch} Summary:")
         print(f"  Train Loss:      {train_loss:.4f}")
@@ -511,6 +699,7 @@ def train_model(
         print(f"  Val Loss:        {val_loss:.4f}")
         print(f"  Val Acc:         {val_acc:.4f}")
         print(f"  Macro F1:        {macro_f1:.4f}")
+        print(f"  Macro AUPRC:     {macro_auprc:.4f}")
         print(f"  Min-Class F1:    {min_class_f1:.4f}")
         print(f"  Weighted F1:     {weighted_f1:.4f}")
         if epoch_worst_challenge_acc is not None:
@@ -518,13 +707,10 @@ def train_model(
         if epoch_holdout_hmean_acc is not None:
             print(f"  Harmonic Mean Holdout Acc: {epoch_holdout_hmean_acc:.4f}")
         
-        # --- NEW EXPLICIT LOGGING FOR STREAM WEIGHTS & UNCERTAINTY ---
+        # --- NEW EXPLICIT LOGGING FOR STREAM WEIGHTS ---
         if stream_weight is not None:
-            if getattr(model, "feature_integration_mode", "") == "dual_stream_dynamic_gate":
-                print(f"  Avg Dynamic Gate Weight: {stream_weight:.4f} (Avg GLM={stream_weight:.1%}, Avg Features={1-stream_weight:.1%})")
-            else:
-                print(f"  Global Stream Weight:    {stream_weight:.4f} (GLM={stream_weight:.1%}, Features={1-stream_weight:.1%})")
-                
+            print(f"  Avg Gate Weight: GLM={stream_weight:.1%}, XGBoost={1-stream_weight:.1%}")
+
         if getattr(model, "loss_log_vars", None) is not None:
             precisions = torch.exp(-model.loss_log_vars).detach().cpu().numpy()
             print(f"  Learnable Aux Weights (Uncertainty Precision):")
@@ -532,10 +718,15 @@ def train_model(
             print(f"    - GLM Output:      {precisions[1]:.4f}")
             print(f"    - Feature Output:  {precisions[2]:.4f}")
             
-        if glm_acc is not None or feat_acc is not None:
-              glm_acc_str = f"{glm_acc:.4f}" if glm_acc is not None else "N/A"
-              feat_acc_str = f"{feat_acc:.4f}" if feat_acc is not None else "N/A"
-              print(f"  Per-Stream Acc:  GLM={glm_acc_str}, Features={feat_acc_str}")
+        if glm_acc is not None or xgb_acc is not None:
+            glm_acc_str = f"{glm_acc:.4f}" if glm_acc is not None else "N/A"
+            xgb_acc_str = f"{xgb_acc:.4f}" if xgb_acc is not None else "N/A"
+            print(f"  Per-Stream Acc:  GLM={glm_acc_str}, XGBoost={xgb_acc_str}")
+        if coarse_acc is not None:
+            if 'coarse_accuracy' not in history:
+                history['coarse_accuracy'] = []
+            history['coarse_accuracy'].append(coarse_acc)
+            print(f"  Coarse Acc (prok/euk): {coarse_acc:.4f}")
         
         print("\nPer-class Validation Metrics:")
         report = classification_report(
@@ -547,25 +738,19 @@ def train_model(
         )
         print(report)
 
-        # print the results of the dynamic gating 
+        # print the results of the dynamic gating
         if val_alphas and len(val_alphas) == len(val_true):
-            print(f"\n  Per-Class Average Dynamic Gate Weights (α):")
-            
-            # Create a dictionary to hold the alphas for each class
             class_alphas = {k: [] for k in idx_to_label.keys()}
-            
-            # Group every alpha by its true biological label
             for true_class, alpha_val in zip(val_true, val_alphas):
                 class_alphas[true_class].append(alpha_val)
-                
-            # Calculate and print the mean for each class
+
+            print(f"\n  Per-Class Average Gate Weights (α = GLM weight):")
             for class_idx in sorted(idx_to_label.keys()):
                 class_name = idx_to_label[class_idx]
                 alphas_list = class_alphas[class_idx]
-                
                 if len(alphas_list) > 0:
                     mean_alpha = sum(alphas_list) / len(alphas_list)
-                    print(f"    - {class_name:>27}: {mean_alpha:.4f} (GLM={mean_alpha:>5.1%}, Features={1-mean_alpha:>5.1%})")
+                    print(f"    - {class_name:>27}: {mean_alpha:.4f} (GLM={mean_alpha:>5.1%}, XGBoost={1-mean_alpha:>5.1%})")
 
         
         # -----------------------------------------------------------------
@@ -574,8 +759,10 @@ def train_model(
         is_best_macro = False
         is_best_holdout = False
 
-        if macro_f1 > best_macro_f1 or (epoch == start_epoch and best_macro_f1 == 0.0):
-            best_macro_f1 = macro_f1
+        min_delta = 0.001
+
+        if macro_auprc > (best_macro_auprc + min_delta) or (epoch == start_epoch and best_macro_auprc == 0.0):
+            best_macro_auprc = macro_auprc
             best_val_loss = val_loss
             best_val_acc = val_acc
             is_best_macro = True
@@ -595,10 +782,10 @@ def train_model(
         # which can happen when imbalance strategies are active.
         if challenge_loaders:
             primary_improved = is_best_holdout
-            patience_msg = f"No objective improved (best macro_f1={best_macro_f1:.4f}, min_class_f1={best_min_class_f1_for_stopping:.4f}, holdout_hmean={best_worst_holdout_acc:.4f})."
+            patience_msg = f"No objective improved (best macro_auprc={best_macro_auprc:.4f}, min_class_f1={best_min_class_f1_for_stopping:.4f}, holdout_hmean={best_worst_holdout_acc:.4f})."
         else:
             primary_improved = is_best_macro
-            patience_msg = f"No objective improved (best macro_f1={best_macro_f1:.4f}, min_class_f1={best_min_class_f1_for_stopping:.4f})."
+            patience_msg = f"No objective improved (best macro_auprc={best_macro_auprc:.4f}, min_class_f1={best_min_class_f1_for_stopping:.4f})."
 
         any_objective_improved = primary_improved or is_best_min_class
         next_patience_counter = 0 if any_objective_improved else (patience_counter + 1)
@@ -635,7 +822,7 @@ def train_model(
                 'worst_challenge_acc': epoch_worst_challenge_acc,
                 'holdout_hmean_acc': epoch_holdout_hmean_acc,
                 'challenge_accuracies': challenge_accuracies,
-                'best_macro_f1': best_macro_f1,
+                'best_macro_auprc': best_macro_auprc,
                 'best_worst_holdout_acc': best_worst_holdout_acc,
                 'best_min_class_f1': best_min_class_f1_for_stopping,
                 'patience_counter': next_patience_counter,
@@ -673,7 +860,7 @@ def train_model(
             cm_df.to_csv(model_save_path / "confusion_matrix.csv")
 
         if is_best_macro:
-            save_best_checkpoint("best_macro_f1_model", "macro F1", macro_f1)
+            save_best_checkpoint("best_macro_auprc_model", "macro AUPRC", macro_auprc)
         if is_best_holdout:
             save_best_checkpoint("best_holdout_model", "Holdout Harmonic-Mean Acc", epoch_holdout_hmean_acc)
 
@@ -690,7 +877,7 @@ def train_model(
         # --- Optuna mid-training pruning ---
         if trial is not None: 
             try: 
-                trial.report(macro_f1,epoch) 
+                trial.report(macro_auprc, epoch) 
                 if trial.should_prune():
                     print(f"\nOptuna pruned trial at epoch {epoch} (macro_f1={macro_f1:.4f}).")
                     raise optuna.TrialPruned()
@@ -718,7 +905,7 @@ def train_model(
             'scheduler_state_dict': scheduler.state_dict(),
             'best_val_acc': best_val_acc,
             'best_val_loss': best_val_loss,
-            'best_macro_f1': best_macro_f1,
+            'best_macro_auprc': best_macro_auprc,
             'best_worst_holdout_acc': best_worst_holdout_acc,
             'best_min_class_f1': best_min_class_f1_for_stopping,
             'patience_counter': patience_counter,

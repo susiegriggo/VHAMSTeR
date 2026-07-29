@@ -3,11 +3,12 @@
 modules to handle sequence embedding and manipulation
 """
 # imports
+import pickle
 import random
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-from typing import List
+from typing import List, Optional
 from Bio import SeqIO
 import math
 
@@ -32,28 +33,61 @@ def uniform_random_chunk_sequence(
     seq:str, 
     max_chunk_size: int = 10000,
     min_chunk_size: int=1000, 
-    target_coverage: float = 1.0
+    target_coverage: float = 1.0,
+    max_retries: int = 50,
 ) -> List[str]:
     """
-    Use a uniform random sampling strategy to fragment sequences
+    Use a uniform random sampling strategy to fragment sequences,
+    enforcing global 1x coverage math to prevent oversampling biases.
     """
     seq_len = len(seq) 
     chunks = []
 
-    if seq_len <= min_chunk_size: 
-        pass 
-    else:
-        effective_max = min(max_chunk_size, seq_len)
-        avg_chunk_size = (min_chunk_size + effective_max) / 2.0
-        num_chunks = math.ceil((seq_len * target_coverage) / avg_chunk_size)
+    # Strictly ignore anything under the hard minimum
+    if seq_len < min_chunk_size:
+        return chunks
 
-        for _ in range(num_chunks):
+    # FIX 1: Calculate Global Expected Chunk Size (mu)
+    mu_global = (min_chunk_size + max_chunk_size) / 2.0
+    
+    # FIX 2: Probabilistic Rounding for N
+    expected_chunks = (seq_len * target_coverage) / mu_global
+    base_chunks = math.floor(expected_chunks)
+    prob = expected_chunks - base_chunks
+    
+    # N becomes base_chunks + 1 (with probability 'prob') or stays base_chunks
+    N = base_chunks + (1 if random.random() < prob else 0)
+    
+    if N == 0:
+        return chunks
+
+    # FIX 3: The "Pass-Through" Rule for Tiny Partitions
+    pass_through_threshold = min_chunk_size + 500
+    if seq_len <= pass_through_threshold:
+        if 'N' not in seq.upper():
+            # If selected for this epoch, pass the whole partition through N times
+            for _ in range(N):
+                chunks.append(seq)
+        return chunks
+
+    # Normal Chunking for larger genomes
+    effective_max = min(max_chunk_size, seq_len)
+    
+    for _ in range(N):
+        for _retry in range(max_retries):
             start = random.randint(0, seq_len - min_chunk_size)
             space_remaining = seq_len - start
             this_max = min(effective_max, space_remaining)
             chunk_length = random.randint(min_chunk_size, this_max)
             chunk = seq[start:start + chunk_length]
+            
+            # Skip if sequence contains undefined nucleotides
+            if 'N' in chunk.upper():
+                continue
+                
             chunks.append(chunk)
+            break
+            
     return chunks
 
 def chunk_sequence(
@@ -101,7 +135,6 @@ def shuffle_sequence(seq: str) -> str:
     seq_list = list(seq)
     random.shuffle(seq_list)
     return ''.join(seq_list)
-
 
 def embed_window(
     seq: str,
@@ -206,15 +239,16 @@ def embed_window(
 class GenomeDataset(Dataset):
     """Dataset for genome sequences with classification labels."""
     def __init__(
-        self, 
-        sequences: List[str], 
-        labels: List[int], 
+        self,
+        sequences: List[str],
+        labels: List[int],
         accessions: List[str],
         tokenizer,
         max_length: int = 100000,
         model_type: str = "bibert",
         features: List[List[float]] = None,
         token_pooling: str = "mean",
+        raw_features: List[List[float]] = None,
     ):
         self.sequences = sequences
         self.labels = labels
@@ -223,6 +257,7 @@ class GenomeDataset(Dataset):
         self.max_length = max_length
         self.model_type = model_type
         self.features = features
+        self.raw_features = raw_features
         self.token_pooling = token_pooling
     
     def __len__(self):
@@ -235,11 +270,12 @@ class GenomeDataset(Dataset):
         
         if self.features is not None:
             try:
-                features = self.features[idx]
+                dense_features = self.features[idx]
             except Exception as e:
                 raise ValueError(f"Features are provided but could not be indexed at idx={idx}: {e}")
+            dense_tensor = torch.tensor(dense_features, dtype=torch.float)
         else:
-            features = None
+            dense_tensor = None
 
         result = {
             'sequence': seq,
@@ -247,7 +283,16 @@ class GenomeDataset(Dataset):
             'accession': accession,
         }
 
-        if features is not None:
-            result['features'] = torch.tensor(features, dtype=torch.float)
+        if dense_tensor is not None:
+            result['features'] = dense_tensor
+
+        if self.raw_features is not None:
+            try:
+                raw_dense = self.raw_features[idx]
+            except Exception as e:
+                raise ValueError(
+                    f"raw_features provided but could not be indexed at idx={idx}: {e}"
+                )
+            result['raw_features'] = torch.tensor(raw_dense, dtype=torch.float)
 
         return result

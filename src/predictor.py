@@ -29,7 +29,7 @@ def predict_batch(model, batch, device, use_fp16=False):
     else:
         outputs = model(**inputs)
     
-    predictions = torch.softmax(outputs, dim=-1).cpu().numpy()
+    predictions = torch.exp(outputs).cpu().numpy()
     return predictions
 
 
@@ -70,7 +70,14 @@ def predict_loader(model, dataloader, device, use_fp16=False, show_progress=True
             # catch the dynamic weights safely
             if hasattr(model, '_last_alpha_batch') and model._last_alpha_batch is not None:
                 batch_alphas = model._last_alpha_batch
-                if isinstance(batch_alphas, (int, float)):
+                if isinstance(batch_alphas, dict):
+                    # tri_stream_dynamic_gate: keys are 'glm', 'arch', 'marker'
+                    if not isinstance(all_alphas, dict):
+                        all_alphas = {'glm': [], 'arch': [], 'marker': []}
+                    for key in ('glm', 'arch', 'marker'):
+                        vals = batch_alphas[key]
+                        all_alphas[key].extend(vals.tolist() if hasattr(vals, 'tolist') else list(vals))
+                elif isinstance(batch_alphas, (int, float)):
                     all_alphas.append(float(batch_alphas))
                 elif hasattr(batch_alphas, 'tolist'):
                     alphas_list = batch_alphas.tolist()
