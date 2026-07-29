@@ -16,6 +16,8 @@ It runs a 5-fold ensemble and writes:
 
 ## Dependencies
 
+### Python packages (installed automatically)
+
 - `click`
 - `loguru`
 - `torch`
@@ -27,12 +29,26 @@ It runs a 5-fold ensemble and writes:
 - `pyrodigal-gv`
 - `tqdm`
 - `scikit-learn`
+- `xgboost`
+- `joblib`
+
+### External tools (must be installed separately)
+
+- `mmseqs2` — used for geNomad marker search. Install via conda:
+
+```bash
+conda install -c bioconda mmseqs2
+```
+
+### geNomad database
+
+A geNomad database is required at runtime and must be downloaded separately.
+See https://github.com/apcamargo/genomad for instructions. Pass the path to the
+database root directory with `--genomad-db`.
 
 ## Installation
 
 ### pip (editable install from repo)
-
-This is the easiest way to install V-HAMSTeR right now.
 
 Clone the repository and install from the repository root:
 
@@ -42,8 +58,10 @@ cd vhamster
 pip install -e .
 ```
 
-This installs all dependencies listed in `pyproject.toml` and registers the
+This installs all Python dependencies listed in `pyproject.toml` and registers the
 `vhamster` and `vhamster-install-models` shell commands.
+
+> **Note:** `mmseqs2` is not a Python package and must be installed via conda (see above).
 
 ### Optional GPU support
 
@@ -67,8 +85,8 @@ afterward is fine and will replace the default wheel if needed.
 
 ### Conda environment (recommended for HPC)
 
-An `environment.yml` is provided. If you want GPU support, edit the
-`pytorch-cuda` version to match your cluster before running:
+An `environment.yml` is provided that includes `mmseqs2` from `bioconda`. If you
+want GPU support, edit the `pytorch-cuda` version to match your cluster before running:
 
 ```bash
 conda env create -f environment.yml
@@ -79,14 +97,14 @@ conda activate vhamster
 
 Model installation is a separate step after installing `vhamster` itself.
 
-Install the pretrained model bundle (v1.0.0) from NERSC:
+Install the pretrained model bundle (v1.2.0) from NERSC:
 
 ```bash
 vhamster-install-models
 ```
 
 By default, this installs into an environment-scoped location in the active Python
-environment: `site-packages/vhamster_models`.
+environment: `site-packages/vhamster_models_v1.2.0`.
 
 If that default location is not writable, install to your own directory instead:
 
@@ -100,18 +118,18 @@ Reinstall if needed:
 vhamster-install-models --force
 ```
 
-The installer places files at:
-- `<install_root>/best_params_20260331`
-- `<install_root>/joint_temperature.pt`
+The installer places the fold directories and calibration parameters at:
+- `<install_root>/fold_0/` … `<install_root>/fold_4/`
+- `<install_root>/length_aware_vector_scaling_anchors_5.json`
 
-If your models are stored elsewhere, pass explicit paths when running inference:
+If your models are stored elsewhere, pass the path explicitly when running inference:
 
 ```bash
 vhamster \
   --fasta input.fasta \
   --output results/ \
-  --ensemble-dir /path/to/best_params_20260331 \
-  --temperature-file /path/to/joint_temperature.pt
+  --ensemble-dir /path/to/vhamster_models_v1.2.0 \
+  --genomad-db /path/to/genomad_db
 ```
 
 Runtime logs are written to `<output>/<prefix>.log` and also shown in the
@@ -119,16 +137,16 @@ terminal.
 
 ## Quick-start example
 
-A test genome (accession NC_110914.1) is
-included in `test_data/`. After installing `vhamster` and the model bundle, run from the repository root
-(the model and temperature file at their default locations will be picked up
-automatically):
+A test genome (accession NC_110914.1) is included in `test_data/`. After
+installing `vhamster`, the model bundle, and a geNomad database, run from the
+repository root:
 
 ```bash
 vhamster \
   --fasta test_data/escherichia_phage.fasta \
   --output results/test_run \
-  --prefix escherichia_phage
+  --prefix escherichia_phage \
+  --genomad-db /path/to/genomad_db
 ```
 
 If your model files are stored elsewhere:
@@ -138,8 +156,8 @@ vhamster \
   --fasta test_data/escherichia_phage.fasta \
   --output results/test_run \
   --prefix escherichia_phage \
-  --ensemble-dir /path/to/best_params_20260331 \
-  --temperature-file /path/to/joint_temperature.pt
+  --ensemble-dir /path/to/vhamster_models_v1.2.0 \
+  --genomad-db /path/to/genomad_db
 ```
 
 This writes two files:
@@ -156,12 +174,13 @@ this *Escherichia* phage.
 
 ## Run
 
-Minimal example (uses the default model directory in the active Python environment):
+Minimal example (models at their default installed location):
 
 ```bash
 vhamster \
   --fasta /path/to/input.fasta \
-  --output /path/to/results_dir
+  --output /path/to/results_dir \
+  --genomad-db /path/to/genomad_db
 ```
 
 Add a custom output prefix:
@@ -170,6 +189,7 @@ Add a custom output prefix:
 vhamster \
   --fasta /path/to/input.fasta \
   --output /path/to/results_dir \
+  --genomad-db /path/to/genomad_db \
   --prefix sampleA
 ```
 
@@ -179,35 +199,29 @@ Use a custom ensemble directory:
 vhamster \
   --fasta /path/to/input.fasta \
   --output /path/to/results_dir \
-  --ensemble-dir /path/to/model_root_with_fold_dirs
+  --genomad-db /path/to/genomad_db \
+  --ensemble-dir /path/to/vhamster_models_v1.2.0
 ```
 
-Benchmark using a single fold model (for example, only `fold_3`):
+Benchmark using a single fold (for example, only `fold_3`):
 
 ```bash
 vhamster \
   --fasta /path/to/input.fasta \
   --output /path/to/results_dir \
-  --ensemble-dir /path/to/model_root_with_fold_dirs \
+  --genomad-db /path/to/genomad_db \
+  --ensemble-dir /path/to/vhamster_models_v1.2.0 \
   --fold-index 3
 ```
 
-Use a non-default temperature file:
+Use a non-default calibration parameters file:
 
 ```bash
 vhamster \
   --fasta /path/to/input.fasta \
   --output /path/to/results_dir \
-  --temperature-file /path/to/joint_temperature.pt
-```
-
-You can also pass temperature directly as a scalar (useful for benchmarking):
-
-```bash
-vhamster \
-  --fasta /path/to/input.fasta \
-  --output /path/to/results_dir \
-  --temperature-file 1.0
+  --genomad-db /path/to/genomad_db \
+  --calibration-params /path/to/length_aware_vector_scaling_anchors_5.json
 ```
 
 ## Outputs
@@ -220,7 +234,6 @@ Chunk file columns include:
 - accession, predicted_host, confidence
 - class probability columns
 - prokaryote_score, eukaryote_score
-- feature columns
 
 Genome file columns include:
 - genome, predicted_host, confidence
