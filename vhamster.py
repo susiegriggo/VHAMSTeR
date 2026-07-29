@@ -179,16 +179,12 @@ def _aggregate_chunks(
     prok_col_idx: Optional[int],
     label_mapping: Dict[int, str],
 ) -> pl.DataFrame:
-    """Mean-pool per-class probabilities across chunks to produce one row per
-    parent genome.  The parent genome ID is the accession with every
-    trailing '_chunk<start>_<end>' suffix stripped.
-
-    Mean-pooling over calibrated probability vectors (rather than majority
-    vote) is the correct aggregation because it preserves the full
-    uncertainty information captured by temperature scaling and the ensemble.
+    """Max-score weighted average of per-class probabilities across chunks.
+    
+    Weights each chunk's contribution to the sequence-level prediction 
+    by its maximum confidence score, ensuring hallmark fragments dictate 
+    the final classification over ambiguous junk regions.
     """
-    # Derive the parent genome ID: strip the trailing _chunk<int>_<int> suffix
-    # produced by _chunk_sequences(), leaving the original FASTA accession.
     genome_col = (
         pl.col("accession")
         .str.replace(r"_chunk\d+_\d+$", "", literal=False)
@@ -196,8 +192,11 @@ def _aggregate_chunks(
     )
     df = chunk_df.with_columns(genome_col)
 
-    # Average per-class probability columns across all chunks of the same genome.
-    agg_exprs = [pl.col(c).mean() for c in class_cols]
+    # Max-score weighted average: sum(prob * confidence) / sum(confidence)
+    agg_exprs = [
+        ((pl.col(c) * pl.col("confidence")).sum() / pl.col("confidence").sum()).alias(c) 
+        for c in class_cols
+    ]
     genome_df = df.group_by("genome").agg(agg_exprs).sort("genome")
 
     # Re-derive predicted host and confidence from the averaged probabilities.
@@ -226,54 +225,24 @@ def _aggregate_chunks(
 
     return genome_df
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _load_length_class_temperatures(
+def _load_calibration_params(
     path: Optional[Union[str, pathlib.Path]],
-) -> Optional[Dict[int, Dict[int, float]]]:
-    """Load per-(class, length) temperatures from a JSON file produced by
-    calibrate_length_aware.py.
-
-    The JSON structure is ``{class_idx_str: {length_bin_str: temperature}}``.
-    Returns None if path is None or the file cannot be found.
-    """
+) -> Optional[Dict]:
+    """Load vector scaling parameters (w0, w1, length_scale) from JSON."""
     if path is None:
         return None
     p = pathlib.Path(str(path))
     if not p.exists():
-        logger.warning(f"Length-class temperature file not found: {p}. Using T=1.0 (uncalibrated).")
+        logger.warning(f"Calibration JSON not found: {p}. Using uncalibrated logits.")
         return None
     with open(p, "r", encoding="utf-8") as f:
-        raw = json.load(f)
-    result: Dict[int, Dict[int, float]] = {
-        int(cls_key): {int(lb): float(t) for lb, t in bins.items()}
-        for cls_key, bins in raw.items()
-    }
-    logger.info(f"Loaded length-class temperatures: {len(result)} class(es) from {p}")
-    return result
-
-
-def _get_length_class_temperature(
-    length_class_temps: Optional[Dict[int, Dict[int, float]]],
-    predicted_class: int,
-    chunk_length: int,
-    fallback: float = 1.0,
-) -> float:
-    """Return the calibrated temperature for a given predicted class and chunk
-    length.  Nearest-bin matching is used so that chunk lengths between
-    calibration grid points map to the closest available temperature.
-    """
-    if length_class_temps is None:
-        return fallback
-    class_temps = length_class_temps.get(predicted_class)
-    if not class_temps:
-        return fallback
-    bins = sorted(class_temps.keys())
-    nearest_bin = min(bins, key=lambda b: abs(b - chunk_length))
-    return class_temps[nearest_bin]
+        data = json.load(f)
+    logger.info(f"Loaded length-aware vector scaling parameters from {p}")
+    return data 
 
 
 def _normalise_label_mapping(mapping: Dict) -> Dict[int, str]:
@@ -689,15 +658,30 @@ def _run(args: Any) -> None:
     avg_logits = accumulated_logits / args.num_folds  # [N, C]
     
     chunk_lengths = [len(s) for s in chunked_seqs]
-    pred_classes_for_temp = avg_logits.argmax(dim=1).tolist()
-    temps_per_chunk = torch.tensor(
-        [
-            _get_length_class_temperature(length_class_temps, int(c), cl)
-            for c, cl in zip(pred_classes_for_temp, chunk_lengths)
-        ],
-        dtype=torch.float32,
-    ).unsqueeze(1)  # [N, 1] for broadcasting
-    calibrated_probs: np.ndarray = F.softmax(avg_logits / temps_per_chunk, dim=-1).numpy()  # [N, C]
+
+    if length_class_temps is not None and "classes" in length_class_temps: 
+        length_scale = float(length_class_temps.get("length_scale", 1000.0))
+        w0_list = []
+        w1_list = []
+        for c in range(num_classes):
+            cls_data = length_class_temps["classes"].get(str(c), {"w0": 0.0, "w1": 1.0})
+            w0_list.append(cls_data["w0"])
+            w1_list.append(cls_data["w1"])
+
+        w0 = torch.tensor(w0_list, dtype=torch.float32)
+        w1 = torch.tensor(w1_list, dtype=torch.float32)
+
+        # L / S
+        lengths_tensor = torch.tensor(chunk_lengths, dtype=torch.float32).clamp(min=1e-6)
+        log_norm_lengths = torch.log(lengths_tensor / length_scale)
+
+        # T_c(L) = exp(w0_c + w1_c * log(L / S))
+        temps = torch.exp(w0.unsqueeze(0) + w1.unsqueeze(0) * log_norm_lengths.unsqueeze(1)) 
+
+    else: 
+        temps = torch.ones_like(avg_logits)
+
+    calibrated_probs: np.ndarray = F.softmax(avg_logits / temps, dim=-1).numpy()
 
     # The DataLoader uses shuffle=False, so accession order matches chunked_accs exactly.
     all_accessions = chunked_accs
@@ -807,7 +791,7 @@ def _run(args: Any) -> None:
 @click.option("--num-folds", type=int, default=5, show_default=True, help="Number of folds to use.")
 @click.option("--fold-index", type=int, default=None, help="Use only one fold by index, e.g. 0..4.")
 @click.option("--checkpoint-subdir", default="best_macro_f1_model", show_default=True, help="Checkpoint subdirectory name.")
-@click.option("--length-class-temperatures", type=str, default=str(_DEFAULT_MODEL_ROOT / "length_class_temperatures_continuous_brier.json"), show_default=True, help="Path to per-(class, length) temperature JSON produced by calibrate_length_aware.py.")
+@click.option("--calibration-params", type=str, default=str(_DEFAULT_MODEL_ROOT / "length_aware_vector_scaling_anchors_5.json"), show_default=True, help="Path to length-aware vector scaling JSON.")
 @click.option("--chunk-size", type=int, default=10000, show_default=True, help="Chunk length in bp.")
 @click.option("--overlap", type=int, default=1000, show_default=True, help="Overlap between chunks in bp.")
 @click.option("--batch-size", type=int, default=16, show_default=True, help="Inference batch size.")
