@@ -786,7 +786,7 @@ def _run(args: Any) -> None:
 @click.option("--output", type=click.Path(path_type=pathlib.Path, file_okay=False), required=True, help="Output directory.")
 @click.option("--prefix", default="vhamster", show_default=True, help="Base filename prefix for outputs.")
 @click.option("--force", "force", is_flag=True, help="Overwrite output if it exists.")
-@click.option("--ensemble-dir", type=click.Path(path_type=pathlib.Path), default=_DEFAULT_MODEL_ROOT / "best_params_20260331", show_default=True, help="Root directory containing fold_* subdirs.")
+@click.option("--ensemble-dir", type=click.Path(path_type=pathlib.Path), default=_DEFAULT_MODEL_ROOT, show_default=True, help="Root directory containing fold_* subdirs.")
 @click.option("--fold-dirs", type=click.Path(path_type=pathlib.Path), multiple=True, help="Explicit fold directories (overrides --ensemble-dir).")
 @click.option("--num-folds", type=int, default=5, show_default=True, help="Number of folds to use.")
 @click.option("--fold-index", type=int, default=None, help="Use only one fold by index, e.g. 0..4.")
@@ -809,7 +809,7 @@ def main(
     num_folds: int,
     fold_index: Optional[int],
     checkpoint_subdir: str,
-    length_class_temperatures: str,
+    calibration_params: str,
     chunk_size: int,
     overlap: int,
     batch_size: int,
@@ -833,7 +833,7 @@ def main(
         num_folds=num_folds,
         fold_index=fold_index,
         checkpoint_subdir=checkpoint_subdir,
-        length_class_temperatures=length_class_temperatures,
+        calibration_params=calibration_params,
         chunk_size=chunk_size,
         overlap=overlap,
         batch_size=batch_size,
