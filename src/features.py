@@ -10,7 +10,7 @@ import pyrodigal_rv
 import pyrodigal_gv
 from typing import Dict, List, Any, Optional
 import numpy as np
-import pandas as pd
+import polars as pl
 
 
 # motifs to detect - following geNomad's classification
@@ -188,8 +188,8 @@ def build_xgb1_marker_features(
     marker_dict: Dict[str, Dict[str, float]],
     marker_classification: Dict[str, str],
     cutoff_dict: Dict[str, float],
-    features_df: pd.DataFrame,
-) -> pd.DataFrame:
+    features_df: Optional[pl.DataFrame] = None,
+) -> pl.DataFrame:
     """
     Build 6 XGB-1 marker features per accession.
 
@@ -246,7 +246,7 @@ def build_xgb1_marker_features(
             "euk_max_bitscore":   _max_or_nan(euk_bs),
         })
 
-    return pd.DataFrame(rows, index=accessions, columns=XGB1_MARKER_FEATURE_NAMES)
+    return pl.DataFrame(rows, schema=XGB1_MARKER_FEATURE_NAMES)
 
 
 def build_xgb2_marker_features(
@@ -254,8 +254,8 @@ def build_xgb2_marker_features(
     marker_dict: Dict[str, Dict[str, float]],
     marker_classification: Dict[str, str],
     cutoff_dict: Dict[str, float],
-    features_df: pd.DataFrame = None,
-) -> pd.DataFrame:
+    features_df: Optional[pl.DataFrame] = None,
+) -> pl.DataFrame:
     """
     Build 8 XGB-2 marker features per accession.
 
@@ -316,14 +316,14 @@ def build_xgb2_marker_features(
             "plant_max_bitscore":      _max_or_nan(plant_bs),
         })
 
-    return pd.DataFrame(rows, index=accessions, columns=XGB2_MARKER_FEATURE_NAMES)
+    return pl.DataFrame(rows, schema=XGB2_MARKER_FEATURE_NAMES)
 
 def build_gate_context_features(
     accessions: List[str],
     marker_dict: Dict[str, Dict[str, float]],
     marker_classification: Dict[str, str],
     cutoff_dict: Dict[str, float],
-    features_df: pd.DataFrame = None,
+    features_df: Optional[pl.DataFrame] = None,
 ) -> np.ndarray:
     """
     Builds the 2 strictly curated contextual gate features per accession:
@@ -334,14 +334,19 @@ def build_gate_context_features(
     """
     valid_codes = {'A', 'F', 'P', 'T', 'K', 'KT'}
     rows = []
-    
+
+    # Build accession -> n_genes lookup from polars DataFrame (must have 'accession' and 'n_genes' columns)
+    _n_genes_lookup: Dict[str, float] = {}
+    if features_df is not None and "accession" in features_df.columns and "n_genes" in features_df.columns:
+        _n_genes_lookup = dict(zip(features_df["accession"].to_list(), features_df["n_genes"].to_list()))
+
     for acc in accessions:
         hits = marker_dict.get(acc, {})
         
         # --- 1. TRUE DENSITY DENOMINATOR (Based on n_genes) ---
         n_genes = 1
-        if features_df is not None and acc in features_df.index:
-            n_genes = features_df.loc[acc, "n_genes"]
+        if features_df is not None and _n_genes_lookup:
+            n_genes = _n_genes_lookup.get(acc, 1)
         denom = max(1.0, float(n_genes))
         
         # --- 2. Collect targets ---
