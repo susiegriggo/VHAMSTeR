@@ -254,6 +254,7 @@ def _run(args: Any) -> None:
     # ── [4/5] Ensemble Inference Loop ────────────────────────────────────────
     logger.info("[4/5] Running ensemble inference across folds")
     accumulated_logits: Optional[torch.Tensor] = None
+    per_fold_verbose: List[Dict] = [] if args.verbose else None
 
     for fold_idx, fold_dir in enumerate(args.fold_dirs_resolved, start=1):
         logger.info(f"--- Fold {fold_idx}/{len(args.fold_dirs_resolved)}: {fold_dir.name} ---")
@@ -391,6 +392,7 @@ def _run(args: Any) -> None:
 
         # Collect Logits
         fold_logits_list = []
+        fold_alphas_list = []
         with torch.no_grad():
             for batch in tqdm(dataloader, desc=f"      Inference", leave=False):
                 inputs = {k: v.to(device) for k, v in batch.items() if k not in {'accession', 'labels'}}
@@ -400,8 +402,24 @@ def _run(args: Any) -> None:
                 else:
                     logits = classifier(**inputs)
                 fold_logits_list.append(logits.cpu())
+                if args.verbose and hasattr(classifier, '_last_alpha_batch'):
+                    alpha = np.atleast_1d(classifier._last_alpha_batch.flatten())
+                    fold_alphas_list.append(alpha)
 
         fold_logits = torch.cat(fold_logits_list, dim=0)
+
+        if args.verbose:
+            fold_probs = np.round(F.softmax(fold_logits, dim=-1).numpy(), 4)
+            fold_alphas = (
+                np.concatenate(fold_alphas_list)
+                if fold_alphas_list
+                else np.full(len(chunked_seqs), np.nan)
+            )
+            per_fold_verbose.append({
+                "fold_name": fold_dir.name,
+                "probs": fold_probs,
+                "alphas": np.round(fold_alphas, 4),
+            })
         if accumulated_logits is None:
             accumulated_logits = fold_logits.clone()
         else:
@@ -429,10 +447,41 @@ def _run(args: Any) -> None:
         
         # T_c(L) = exp(w0_c + w1_c * log(L/S))
         temps = torch.exp(w0.unsqueeze(0) + w1.unsqueeze(0) * log_norm_lengths.unsqueeze(1))
+        
+        # --- Top-Label Proportional Redistribution (Log-Odds) ---
+        raw_probs = torch.softmax(avg_logits, dim=-1)
+        pred_cls = torch.argmax(avg_logits, dim=-1)
+        n = avg_logits.shape[0]
+        idx = torch.arange(n)
+        
+        # Get the temperature specifically for the predicted class
+        top_temp = temps[idx, pred_cls]
+        
+        # Convert raw top probability to log-odds for BCE calibration
+        top_raw = raw_probs[idx, pred_cls]
+        top_raw_clamp = top_raw.clamp(min=1e-7, max=1.0 - 1e-7)
+        bce_logit = torch.log(top_raw_clamp / (1.0 - top_raw_clamp))
+        
+        # Calibrate the log-odds via temperature and sigmoid
+        cal_top = torch.sigmoid(bce_logit / top_temp)
+        
+        # Proportional redistribution for runner-up classes
+        remaining_raw = (1.0 - top_raw).clamp(min=1e-8)
+        remaining_cal = (1.0 - cal_top).clamp(min=0.0)
+        scale = (remaining_cal / remaining_raw).unsqueeze(1)
+        
+        final_probs = raw_probs * scale
+        final_probs[idx, pred_cls] = cal_top
+        
+        # Re-normalise to correct any floating-point drift
+        final_probs = final_probs / final_probs.sum(dim=-1, keepdim=True)
+        calibrated_probs = np.round(final_probs.numpy(), 4)
+        
     else:
-        temps = torch.ones_like(avg_logits)
+        # Fallback if no calibration file is found
+        calibrated_probs = np.round(torch.softmax(avg_logits, dim=-1).numpy(), 4)
 
-    calibrated_probs = F.softmax(avg_logits / temps, dim=-1).numpy()
+
     class_cols = [label_mapping.get(i, f"class_{i}") for i in range(num_classes)]
     pred_indices = np.argmax(calibrated_probs, axis=1)
     confidences = np.max(calibrated_probs, axis=1)
@@ -458,6 +507,30 @@ def _run(args: Any) -> None:
         df_genomes.write_csv(args.genome_output, separator="\t")
         logger.info(f"Genome-level predictions written to: {args.genome_output}")
 
+    if args.verbose and per_fold_verbose:
+        verbose_rows = []
+        for fold_data in per_fold_verbose:
+            fold_probs = fold_data["probs"]
+            fold_alphas = fold_data["alphas"]
+            fold_pred_indices = np.argmax(fold_probs, axis=1)
+            fold_confidences = np.max(fold_probs, axis=1)
+            fold_predicted_hosts = [label_mapping.get(int(i), f"class_{i}") for i in fold_pred_indices]
+            for j, acc in enumerate(chunked_accs):
+                row: Dict = {
+                    "accession": acc,
+                    "fold": fold_data["fold_name"],
+                    "predicted_host": fold_predicted_hosts[j],
+                    "confidence": float(fold_confidences[j]),
+                    "glm_gate_weight": None if np.isnan(fold_alphas[j]) else float(fold_alphas[j]),
+                }
+                for i, col in enumerate(class_cols):
+                    row[col] = float(fold_probs[j, i])
+                verbose_rows.append(row)
+        df_verbose = pl.DataFrame(verbose_rows).sort(["accession", "fold"])
+        verbose_path = args.output_dir / f"{args.prefix}.verbose.tsv"
+        df_verbose.write_csv(verbose_path, separator="\t")
+        logger.info(f"Verbose per-fold predictions written to: {verbose_path}")
+
     logger.info("Done!")
 
 
@@ -480,6 +553,7 @@ def _run(args: Any) -> None:
 @click.option("--num-workers", type=int, default=4, show_default=True, help="DataLoader workers.")
 @click.option("--aggregate-chunks/--no-aggregate-chunks", default=True, show_default=True, help="Enable/disable genome-level consensus output.")
 @click.option("--genome-output", type=click.Path(path_type=pathlib.Path), default=None, help="Path for genome-level TSV output.")
+@click.option("--verbose", is_flag=True, help="Write per-fold predictions and GLM gate weights to {prefix}.verbose.tsv.")
 def main(
     fasta: pathlib.Path,
     output: pathlib.Path,
@@ -499,6 +573,7 @@ def main(
     num_workers: int,
     aggregate_chunks: bool,
     genome_output: Optional[pathlib.Path],
+    verbose: bool,
 ) -> None:
     output_dir = output
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -524,6 +599,7 @@ def main(
         num_workers=num_workers,
         aggregate_chunks=aggregate_chunks,
         genome_output=genome_output,
+        verbose=verbose,
     )
 
     if args.aggregate_chunks and args.genome_output is None:
