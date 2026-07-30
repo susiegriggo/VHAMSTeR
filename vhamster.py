@@ -541,7 +541,7 @@ def _run(args: Any) -> None:
 @click.option("--force", "force", is_flag=True, help="Overwrite output if it exists.")
 @click.option("--ensemble-dir", type=click.Path(path_type=pathlib.Path), default=_DEFAULT_MODEL_ROOT, show_default=True, help="Root directory containing fold_* subdirs.")
 @click.option("--fold-dirs", type=click.Path(path_type=pathlib.Path), multiple=True, help="Explicit fold directories (overrides --ensemble-dir).")
-@click.option("--genomad-db", type=click.Path(path_type=pathlib.Path), default=None, help="geNomad MMseqs2 DB path.", required=True)
+@click.option("--genomad-db", type=click.Path(path_type=pathlib.Path), default=None, help="geNomad MMseqs2 DB path.")
 @click.option("--num-folds", type=int, default=5, show_default=True, help="Number of folds to use.")
 @click.option("--fold-index", type=int, default=None, help="Use only one fold by index, e.g. 0..4.")
 @click.option("--checkpoint-subdir", default="best_macro_auprc_model", show_default=True, help="Checkpoint subdirectory name.")
@@ -578,6 +578,16 @@ def main(
     output_dir = output
     output_dir.mkdir(parents=True, exist_ok=True)
     log_path = _configure_logging(output_dir, prefix)
+
+    # Go looking for genomad database 
+    if genomad_db is None:
+        genomad_db = ensemble_dir / "genomad_db"
+        
+    if not (genomad_db / "genomad_marker_metadata.tsv").exists():
+        raise click.ClickException(
+            f"geNomad database not found at {genomad_db}. "
+            "Please run 'install_models.py' to download it, or provide an explicit path using --genomad-db."
+        )
 
     args = SimpleNamespace(
         fasta=fasta,

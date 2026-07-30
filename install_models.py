@@ -393,6 +393,31 @@ def untar(tarball_path: Path, output_path: str, version: str = "1.2.0"):
         sys.exit(f"Extraction error: {e}")
 
 
+def download_genomad_db(model_dir: str):
+    """Uses the native geNomad CLI to download the database into the model directory."""
+    genomad_db_path = os.path.join(model_dir, "genomad_db")
+    
+    if os.path.exists(os.path.join(genomad_db_path, "genomad_marker_metadata.tsv")):
+        logger.info(f"geNomad database already exists at: {genomad_db_path}")
+        return
+
+    logger.info("="*60)
+    logger.info(f"Downloading geNomad database to: {genomad_db_path}")
+    logger.info("="*60)
+    
+    try:
+        # Calls the native genomad CLI command
+        sp.run(["genomad", "download-database", genomad_db_path], check=True)
+        logger.info("geNomad database downloaded successfully!")
+    except FileNotFoundError:
+        logger.error("The 'genomad' command was not found. Please ensure geNomad is installed in this environment.")
+        sys.exit(1)
+    except sp.CalledProcessError as e:
+        logger.error(f"Failed to download the geNomad database. Error: {e}")
+        sys.exit(1) 
+
+
+
 def get_models_nersc(model_dir: str, version: str = "1.2.0"):
     """
     Download vHAMSTeR models from NERSC portal
@@ -496,8 +521,10 @@ def main(outdir, force, version, debug):
         logger.info("Force reinstall requested. Will reinstall models even if they exist.")
     
     instantiate_install(model_dir, force, version)
+
+    # Download the genomad database 
+    download_genomad_db(model_dir)
     
-    # Final verification and summary
     # Final verification and summary
     logger.info("\n" + "="*60)
     logger.info("INSTALLATION SUMMARY")
