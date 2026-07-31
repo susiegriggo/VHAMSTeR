@@ -418,10 +418,12 @@ def write_annotation_rows(annotation_rows: List[Dict[str, str]], output_tsv: pat
     """Write per-hit annotations to TSV, including amino-acid sequences and marker metadata."""
     output_tsv.parent.mkdir(parents=True, exist_ok=True)
     if annotation_rows:
-        pl.DataFrame(annotation_rows).to_csv(output_tsv, separator="\t", index=False)
+        # Changed to_csv to write_csv and removed index=False
+        pl.DataFrame(annotation_rows).write_csv(output_tsv, separator="\t")
     else:
+        # Changed to_csv to write_csv and removed index=False
         pl.DataFrame(
-            columns=[
+            schema=[
                 "parent_seq_id",
                 "protein_id",
                 "amino_acid_sequence",
@@ -447,7 +449,7 @@ def write_annotation_rows(annotation_rows: List[Dict[str, str]], output_tsv: pat
                 "query_coverage",
                 "target_coverage",
             ]
-        ).to_csv(output_tsv, separator="\t", index=False)
+        ).write_csv(output_tsv, separator="\t")
     print(f"[genomad] Saved hit annotations to {output_tsv}")
 
 

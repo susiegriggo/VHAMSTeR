@@ -41,13 +41,9 @@ _SRC = _ROOT / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from genomad_markers import extract_genomad_markers
+from genomad_markers import extract_genomad_markers, write_annotation_rows
 from features import (
     ARCH_FEATURE_NAMES,
-    ARCH_FEATURE_NAMES_NO_FRAGMENT,
-    XGB1_MARKER_FEATURE_NAMES,
-    XGB2_MARKER_FEATURE_NAMES,
-    build_gate_context_features,
     build_xgb1_marker_features,
     build_xgb2_marker_features,
     extract_features_worker,
@@ -166,8 +162,8 @@ def _aggregate_chunks(
         ])
 
     lead_cols = ["genome", "predicted_host", "confidence"]
-    rest = [c for c in genome_df.columns if c not in lead_cols]
-    return genome_df.select(lead_cols + rest)
+    #rest = [c for c in genome_df.columns if c not in lead_cols]
+    return genome_df.select(lead_cols)
 
 
 def _chunk_sequences(seqs: List[str], accessions: List[str], chunk_size: int, overlap: int) -> Tuple[List[str], List[str]]:
@@ -245,12 +241,21 @@ def _run(args: Any) -> None:
 
     logger.info("      Running MMseqs2 against geNomad marker database...")
     seq_dict = dict(zip(chunked_accs, chunked_seqs))
-    genomad_marker_dict = extract_genomad_markers(
+
+    # Update the function call to request details 
+    marker_hits, _, annotation_rows = extract_genomad_markers(
         sequences=seq_dict,
         genomad_db=args.genomad_db,
         genomad_metadata=genomad_metadata,
+        return_details=True  # Request detailed output for verbose logging
     )
+    genomad_marker_dict = marker_hits 
 
+    # write a gene prediction table 
+    gene_table_path = args.output_dir / f"{args.prefix}.gene_predictions.tsv"
+    write_annotation_rows(annotation_rows, gene_table_path)
+    logger.info(f"      Gene prediction table written to: {gene_table_path}")
+    
     # ── [4/5] Ensemble Inference Loop ────────────────────────────────────────
     logger.info("[4/5] Running ensemble inference across folds")
     accumulated_logits: Optional[torch.Tensor] = None
@@ -291,6 +296,11 @@ def _run(args: Any) -> None:
         xgb_arch_df = features_df_arch.select(arch_cols_no_frag).fill_null(0.0)
         x_all_df = pl.concat([xgb_arch_df, xgb1_mf_df], how="horizontal")
         x_euk_df = pl.concat([xgb_arch_df, xgb2_mf_df], how="horizontal")
+
+        # Add a combine feature dictionary for this fold 
+        unique_euk_cols = [c for c in x_euk_df.columns if c not in x_all_df.columns]
+        fold_features_df = pl.concat([x_all_df, x_euk_df.select(unique_euk_cols)], how="horizontal")
+        fold_features_dicts = fold_features_df.to_dicts()
 
         exp_xgb1 = xgb1_booster.feature_names
         exp_xgb2 = xgb2_booster.feature_names
@@ -419,6 +429,7 @@ def _run(args: Any) -> None:
                 "fold_name": fold_dir.name,
                 "probs": fold_probs,
                 "alphas": np.round(fold_alphas, 4),
+                "features": fold_features_dicts
             })
         if accumulated_logits is None:
             accumulated_logits = fold_logits.clone()
@@ -525,7 +536,12 @@ def _run(args: Any) -> None:
                 }
                 for i, col in enumerate(class_cols):
                     row[col] = float(fold_probs[j, i])
+
+                # inject all architecture and marker features 
+                row.update(fold_data["features"][j] )
+
                 verbose_rows.append(row)
+
         df_verbose = pl.DataFrame(verbose_rows).sort(["accession", "fold"])
         verbose_path = args.output_dir / f"{args.prefix}.verbose.tsv"
         df_verbose.write_csv(verbose_path, separator="\t")
