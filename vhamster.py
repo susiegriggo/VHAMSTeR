@@ -568,7 +568,6 @@ def _run(args: Any) -> None:
 @click.option("--fp16", is_flag=True, help="Use FP16 mixed precision.")
 @click.option("--num-workers", type=int, default=4, show_default=True, help="DataLoader workers.")
 @click.option("--aggregate-chunks/--no-aggregate-chunks", default=True, show_default=True, help="Enable/disable genome-level consensus output.")
-@click.option("--genome-output", type=click.Path(path_type=pathlib.Path), default=None, help="Path for genome-level TSV output.")
 @click.option("--verbose", is_flag=True, help="Write per-fold predictions and GLM gate weights to {prefix}.verbose.tsv.")
 def main(
     fasta: pathlib.Path,
@@ -588,7 +587,6 @@ def main(
     fp16: bool,
     num_workers: int,
     aggregate_chunks: bool,
-    genome_output: Optional[pathlib.Path],
     verbose: bool,
 ) -> None:
     output_dir = output
@@ -624,12 +622,9 @@ def main(
         fp16=fp16,
         num_workers=num_workers,
         aggregate_chunks=aggregate_chunks,
-        genome_output=genome_output,
+        genome_output=output_dir / f"{prefix}.genomes.tsv",
         verbose=verbose,
     )
-
-    if args.aggregate_chunks and args.genome_output is None:
-        args.genome_output = args.output_dir / f"{args.prefix}.genomes.tsv"
 
     args.fold_dirs_resolved = _discover_fold_dirs(args)
     if args.fold_index is not None:

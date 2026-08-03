@@ -27,7 +27,7 @@ VERSION_DICTIONARY = {
         "md5": None,  # Will be calculated or user can provide
         "db_url": "https://portal.nersc.gov/cfs/m342/V-HAMSTeR/vhamster_models_v1.2.0.tar.gz",
         "dir_name": "vhamster_models_v1.2.0",
-        "expected_structure": ["fold_0", "fold_1", "fold_2", "fold_3", "fold_4", "length_aware_vector_scaling_anchors_5.json"],
+        "expected_structure": ["fold_0", "fold_1", "fold_2", "fold_3", "fold_4", "length_aware_vector_scaling_anchors_toplabel_5.json"],
     }
 }
 
