@@ -15,6 +15,7 @@ import multiprocessing
 import pathlib
 import pickle
 import re
+import shutil
 import sys
 import sysconfig
 from concurrent.futures import ProcessPoolExecutor
@@ -564,6 +565,48 @@ def _run(args: Any) -> None:
     logger.info("Done!")
 
 
+def _preflight_checks(args: Any) -> None:
+    """Verify required binaries, databases, and model files are present before running."""
+    errors: List[str] = []
+
+    # mmseqs2 binary
+    if shutil.which("mmseqs") is None:
+        errors.append(
+            "mmseqs2 binary not found in PATH. Install via conda:\n"
+            "    conda install -c bioconda mmseqs2"
+        )
+
+    # geNomad MMseqs2 database (beyond the metadata TSV already checked in main())
+    genomad_db = pathlib.Path(args.genomad_db)
+    mmseqs_db_type = genomad_db / "genomad_db.dbtype"
+    if not mmseqs_db_type.exists():
+        errors.append(
+            f"geNomad MMseqs2 database not found at {genomad_db / 'genomad_db'}. "
+            "Run 'vhamster-install-models' to download it, or provide --genomad-db."
+        )
+
+    # Per-fold model files
+    for fold_dir in args.fold_dirs_resolved:
+        if not (fold_dir / "config.json").exists():
+            errors.append(
+                f"Missing config.json in {fold_dir}. Run 'vhamster-install-models'."
+            )
+        adapter_dir = fold_dir / args.checkpoint_subdir
+        if not (adapter_dir / "adapter_config.json").exists():
+            errors.append(
+                f"Missing adapter_config.json in {adapter_dir}. Run 'vhamster-install-models'."
+            )
+        xgb_json = fold_dir / "xgb_stacking_artifacts" / "xgb_stacking_artifacts.json"
+        if not xgb_json.exists():
+            errors.append(
+                f"Missing XGBoost artifacts at {xgb_json}. Run 'vhamster-install-models'."
+            )
+
+    if errors:
+        msg = "\n  ".join(errors)
+        raise click.ClickException(f"Pre-flight validation failed:\n  {msg}")
+
+
 @click.command(context_settings={"help_option_names": ["-h", "--help"]})
 @click.option("--fasta", type=click.Path(path_type=pathlib.Path, exists=True, dir_okay=False), required=True, help="Input FASTA file.")
 @click.option("--output", type=click.Path(path_type=pathlib.Path, file_okay=False), required=True, help="Output directory.")
@@ -668,6 +711,7 @@ def main(
             calibration_params = str(alt_calib)
 
     logger.info(f"Logging to: {log_path}")
+    _preflight_checks(args)
     _run(args)
 
 
