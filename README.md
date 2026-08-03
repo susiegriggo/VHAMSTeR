@@ -4,7 +4,7 @@
 
 **V**irus **H**ost **A**ssignment **M**odel using **S**equence **T**ransformers and **R**eading-frames
 
-V-HAMSTeR uses a genomic language model to predict the host of a virus as one of: animal, plant, fungi, protist, or prokaryote.
+VHAMSTeR uses a genomic language model to predict the host of a virus as one of: animal, plant, fungi, protist, or prokaryote.
 
 It is designed for viral sequences up to 10 kbp. Longer sequences are split
 into 10 kbp chunks, each chunk is scored independently, and the chunk predictions are
@@ -228,9 +228,7 @@ Genome file columns include:
 - prokaryote_score, eukaryote_score
 
 
-## License + Copyright
-
-*** License Agreement ***
+## License Agreement
 Lawrence Berkeley National Laboratory 
 NON-COMMERCIAL USE ONLY LICENSE
  
@@ -251,7 +249,7 @@ Redistribution and use in source and binary forms, with or without modification,
 (6) In the event User creates any bug fixes, patches, upgrades, updates, modifications, derivative works or enhancements to the source code or binary code of the software ("Enhancements") User hereby grants Berkeley Lab and the U.S. Government a paid-up, non-exclusive, irrevocable, worldwide license in the Enhancements to reproduce, prepare derivative works, distribute copies to the public, perform publicly and display publicly, and to permit others to do so.
 THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-*** Copyright Notice ***
+## Copyright Notice 
 V-HAMSTeR Copyright (c) 2026, The Regents of the University of California, through Lawrence Berkeley National Laboratory (“Berkeley Lab”) subject to receipt of any required approvals from the U.S. Dept. of Energy.  All rights reserved.
 If you have questions about your rights to use or distribute this software, please contact Berkeley Lab's Intellectual Property Office at IPO@lbl.gov.
 NOTICE: This Software was developed under Contract No. DE-AC02-05CH11231 with the Department of Energy (“DOE”). During the period of commercialization or such other time period specified by DOE, the U.S. Government is granted for itself and others acting on its behalf a nonexclusive, paid-up, irrevocable, worldwide license in the Software to reproduce, prepare derivative works, and perform publicly and display publicly, by or on behalf of the U.S. Government. Subsequent to that period, the U.S. Government is granted for itself and others acting on its behalf a nonexclusive, paid-up, irrevocable, worldwide license in the Software to reproduce, prepare derivative works, distribute copies to the public, perform publicly and display publicly, and to permit others to do so. The specific term of the license can be identified by inquiry made to Lawrence Berkeley National Laboratory or DOE. NEITHER THE UNITED STATES NOR THE UNITED STATES DEPARTMENT OF ENERGY, NOR ANY OF THEIR EMPLOYEES, MAKES ANY WARRANTY, EXPRESS OR IMPLIED, OR ASSUMES ANY LEGAL LIABILITY OR RESPONSIBILITY FOR THE ACCURACY, COMPLETENESS, OR USEFULNESS OF ANY DATA, APPARATUS, PRODUCT, OR PROCESS DISCLOSED, OR REPRESENTS THAT ITS USE WOULD NOT INFRINGE PRIVATELY OWNED RIGHTS.
