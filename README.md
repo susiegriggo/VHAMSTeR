@@ -145,26 +145,24 @@ terminal.
 ## Quick-start example
 
 A test genome (accession NC_110914.1) is included in `test_data/`. After
-installing `vhamster`, the model bundle, and a geNomad database, run from the
+installing `vhamster` and running `vhamster-install-models`, run from the
 repository root:
 
 ```bash
 vhamster \
   --fasta test_data/escherichia_phage.fasta \
   --output results/test_run \
-  --prefix escherichia_phage \
-  --genomad-db /path/to/genomad_db
+  --prefix escherichia_phage
 ```
 
-If your model files are stored elsewhere:
+If your model files are stored in a non-default location:
 
 ```bash
 vhamster \
   --fasta test_data/escherichia_phage.fasta \
   --output results/test_run \
   --prefix escherichia_phage \
-  --ensemble-dir /path/to/vhamster_models_v1.2.0 \
-  --genomad-db /path/to/genomad_db
+  --ensemble-dir /path/to/vhamster_models_v1.2.0
 ```
 
 This writes two files:
@@ -186,8 +184,7 @@ Minimal example (models at their default installed location):
 ```bash
 vhamster \
   --fasta /path/to/input.fasta \
-  --output /path/to/results_dir \
-  --genomad-db /path/to/genomad_db
+  --output /path/to/results_dir
 ```
 
 Add a custom output prefix:
@@ -196,7 +193,6 @@ Add a custom output prefix:
 vhamster \
   --fasta /path/to/input.fasta \
   --output /path/to/results_dir \
-  --genomad-db /path/to/genomad_db \
   --prefix sampleA
 ```
 
@@ -206,7 +202,6 @@ Use a custom ensemble directory:
 vhamster \
   --fasta /path/to/input.fasta \
   --output /path/to/results_dir \
-  --genomad-db /path/to/genomad_db \
   --ensemble-dir /path/to/vhamster_models_v1.2.0
 ```
 
@@ -216,7 +211,6 @@ Benchmark using a single fold (for example, only `fold_3`):
 vhamster \
   --fasta /path/to/input.fasta \
   --output /path/to/results_dir \
-  --genomad-db /path/to/genomad_db \
   --ensemble-dir /path/to/vhamster_models_v1.2.0 \
   --fold-index 3
 ```
@@ -227,7 +221,6 @@ Use a non-default calibration parameters file:
 vhamster \
   --fasta /path/to/input.fasta \
   --output /path/to/results_dir \
-  --genomad-db /path/to/genomad_db \
   --calibration-params /path/to/length_aware_vector_scaling_anchors_toplabel_5.json
 ```
 
