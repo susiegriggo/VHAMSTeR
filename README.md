@@ -42,9 +42,7 @@ conda install -c bioconda mmseqs2
 
 ### geNomad database
 
-A geNomad database is required at runtime and must be downloaded separately.
-See https://github.com/apcamargo/genomad for instructions. Pass the path to the
-database root directory with `--genomad-db`.
+A geNomad database is required at runtime. `vhamster-install-models` downloads it automatically from [Zenodo](https://zenodo.org/records/14886553). If you have an existing geNomad database you can point to it with `--genomad-db` instead.
 
 ## Installation
 
@@ -97,13 +95,13 @@ conda activate vhamster
 
 Model installation is a separate step after installing `vhamster` itself.
 
-Install the pretrained model bundle (v1.2.0) from NERSC:
+This downloads the pretrained model weights from [HuggingFace](https://huggingface.co/DOEJGI/vhamster-models-v1.2.0) and the geNomad marker database from [Zenodo](https://zenodo.org/records/14886553):
 
 ```bash
 vhamster-install-models
 ```
 
-By default, this installs into an environment-scoped location in the active Python
+By default, everything is installed into an environment-scoped location in the active Python
 environment: `site-packages/vhamster_models_v1.2.0`.
 
 If that default location is not writable, install to your own directory instead:
@@ -115,21 +113,30 @@ vhamster-install-models -o /path/to/my_vhamster_models
 Reinstall if needed:
 
 ```bash
-vhamster-install-models --force
+vhamster-install-models -f
 ```
 
-The installer places the fold directories and calibration parameters at:
-- `<install_root>/fold_0/` … `<install_root>/fold_4/`
-- `<install_root>/length_aware_vector_scaling_anchors_5.json`
+The installer places files at:
+- `<install_root>/fold_0/` … `<install_root>/fold_4/` — ensemble model weights
+- `<install_root>/length_aware_vector_scaling_anchors_toplabel_5.json` — calibration parameters
+- `<install_root>/genomad_db/` — geNomad marker database
 
-If your models are stored elsewhere, pass the path explicitly when running inference:
+Once installed, vhamster will find the geNomad database automatically. If you have an existing geNomad database elsewhere, you can point to it with `--genomad-db`:
 
 ```bash
 vhamster \
   --fasta input.fasta \
   --output results/ \
-  --ensemble-dir /path/to/vhamster_models_v1.2.0 \
   --genomad-db /path/to/genomad_db
+```
+
+If your models are stored in a non-default location, pass the path with `--ensemble-dir`:
+
+```bash
+vhamster \
+  --fasta input.fasta \
+  --output results/ \
+  --ensemble-dir /path/to/vhamster_models_v1.2.0
 ```
 
 Runtime logs are written to `<output>/<prefix>.log` and also shown in the
@@ -221,14 +228,15 @@ vhamster \
   --fasta /path/to/input.fasta \
   --output /path/to/results_dir \
   --genomad-db /path/to/genomad_db \
-  --calibration-params /path/to/length_aware_vector_scaling_anchors_5.json
+  --calibration-params /path/to/length_aware_vector_scaling_anchors_toplabel_5.json
 ```
 
 ## Outputs
 
 For prefix `sampleA`, output files are:
-- `/path/to/results_dir/sampleA.chunks.tsv`
-- `/path/to/results_dir/sampleA.genomes.tsv`
+- `/path/to/results_dir/sampleA.chunks.tsv` — per-chunk predictions
+- `/path/to/results_dir/sampleA.genomes.tsv` — genome-level consensus (mean-pooled over chunks)
+- `/path/to/results_dir/sampleA.folds.tsv` — per-fold predictions and GLM gate weights for all 5 ensemble members
 
 Chunk file columns include:
 - accession, predicted_host, confidence
@@ -237,8 +245,10 @@ Chunk file columns include:
 
 Genome file columns include:
 - genome, predicted_host, confidence
-- mean-pooled class probability columns
-- prokaryote_score, eukaryote_score
+
+Folds file columns include:
+- accession, fold, predicted_host, confidence, glm_gate_weight
+- class probability columns
 
 
 ## License Agreement
