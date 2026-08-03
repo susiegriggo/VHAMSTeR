@@ -32,13 +32,15 @@ It runs a 5-fold ensemble and writes:
 - `xgboost`
 - `joblib`
 
-### External tools (must be installed separately)
+### External tools
 
-- `mmseqs2` — used for geNomad marker search. Install via conda:
+- `mmseqs2` — used for geNomad marker search. If you use the conda environment (see below), it is included automatically. Otherwise install it via conda/mamba:
 
 ```bash
 conda install -c bioconda mmseqs2
 ```
+
+Alternatively, precompiled static binaries are available from the [MMseqs2 GitHub releases](https://github.com/soedinglab/MMseqs2/releases).
 
 ### geNomad database
 
@@ -59,7 +61,7 @@ pip install -e .
 This installs all Python dependencies listed in `pyproject.toml` and registers the
 `vhamster` and `vhamster-install-models` shell commands.
 
-> **Note:** `mmseqs2` is not a Python package and must be installed via conda (see above).
+> **Note:** `mmseqs2` is not a Python package and must be installed separately (see above).
 
 ### Optional GPU support
 

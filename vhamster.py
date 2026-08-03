@@ -255,7 +255,7 @@ def _run(args: Any) -> None:
     # 3a. PyRodigal
     arch_feature_names = list(ARCH_FEATURE_NAMES) + ["n_genes"]
     n_workers = min(multiprocessing.cpu_count(), len(chunked_seqs), 8)
-    args_list = [(s, a, False, arch_feature_names, args.chunk_size) for s, a in zip(chunked_seqs, chunked_accs)]
+    args_list = [(s, a, arch_feature_names, args.chunk_size) for s, a in zip(chunked_seqs, chunked_accs)]
     with ProcessPoolExecutor(max_workers=n_workers) as ex:
         raw_arch_features = list(tqdm(ex.map(extract_features_worker, args_list), total=len(chunked_seqs), desc="      PyRodigal"))
 
