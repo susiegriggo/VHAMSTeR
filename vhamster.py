@@ -115,6 +115,36 @@ def _load_calibration_params(path: Optional[Union[str, pathlib.Path]]) -> Option
     return data
 
 
+def _apply_calibration(logits: torch.Tensor, calib_params: Optional[Dict], chunk_lengths: List[int], num_classes: int) -> np.ndarray:
+    """Apply length-aware vector scaling calibration to a set of logits."""
+    if calib_params and "classes" in calib_params:
+        length_scale = float(calib_params.get("length_scale", 1000.0))
+        w0 = torch.tensor([calib_params["classes"].get(str(c), {"w0": 0.0})["w0"] for c in range(num_classes)], dtype=torch.float32)
+        w1 = torch.tensor([calib_params["classes"].get(str(c), {"w1": 0.0})["w1"] for c in range(num_classes)], dtype=torch.float32)
+        lengths_tensor = torch.tensor(chunk_lengths, dtype=torch.float32).clamp(min=1e-6)
+        log_norm_lengths = torch.log(lengths_tensor / length_scale)
+        temps = torch.exp(w0.unsqueeze(0) + w1.unsqueeze(0) * log_norm_lengths.unsqueeze(1))
+
+        raw_probs = torch.softmax(logits, dim=-1)
+        pred_cls = torch.argmax(logits, dim=-1)
+        n = logits.shape[0]
+        idx = torch.arange(n)
+        top_temp = temps[idx, pred_cls]
+        top_raw = raw_probs[idx, pred_cls]
+        top_raw_clamp = top_raw.clamp(min=1e-7, max=1.0 - 1e-7)
+        bce_logit = torch.log(top_raw_clamp / (1.0 - top_raw_clamp))
+        cal_top = torch.sigmoid(bce_logit / top_temp)
+        remaining_raw = (1.0 - top_raw).clamp(min=1e-8)
+        remaining_cal = (1.0 - cal_top).clamp(min=0.0)
+        scale = (remaining_cal / remaining_raw).unsqueeze(1)
+        final_probs = raw_probs * scale
+        final_probs[idx, pred_cls] = cal_top
+        final_probs = final_probs / final_probs.sum(dim=-1, keepdim=True)
+        return np.round(final_probs.numpy(), 4)
+    else:
+        return np.round(torch.softmax(logits, dim=-1).numpy(), 4)
+
+
 def _reconstruct_hierarchical_probs(xgb1_probs, xgb2_probs, n_fine_classes, prokaryote_idx, euk_fine_indices):
     out = np.zeros((xgb1_probs.shape[0], n_fine_classes), dtype=np.float32)
     out[:, prokaryote_idx] = xgb1_probs[:, 0]
@@ -419,17 +449,16 @@ def _run(args: Any) -> None:
                     fold_alphas_list.append(alpha)
 
         fold_logits = torch.cat(fold_logits_list, dim=0)
-        fold_probs = np.round(F.softmax(fold_logits, dim=-1).numpy(), 4)
         fold_alphas = np.round(
             np.concatenate(fold_alphas_list) if fold_alphas_list else np.full(len(chunked_seqs), np.nan),
             4,
         )
-        per_fold_basic.append({"fold_name": fold_dir.name, "probs": fold_probs, "alphas": fold_alphas})
+        per_fold_basic.append({"fold_name": fold_dir.name, "logits": fold_logits, "alphas": fold_alphas})
 
         if args.verbose:
             per_fold_verbose.append({
                 "fold_name": fold_dir.name,
-                "probs": fold_probs,
+                "logits": fold_logits,
                 "alphas": fold_alphas,
                 "features": fold_features_dicts
             })
@@ -448,51 +477,12 @@ def _run(args: Any) -> None:
     avg_logits = accumulated_logits / len(args.fold_dirs_resolved)
     chunk_lengths = [len(s) for s in chunked_seqs]
 
-    if calib_params and "classes" in calib_params:
-        length_scale = float(calib_params.get("length_scale", 1000.0))
-        w0_list = [calib_params["classes"].get(str(c), {"w0": 0.0})["w0"] for c in range(num_classes)]
-        w1_list = [calib_params["classes"].get(str(c), {"w1": 0.0})["w1"] for c in range(num_classes)]
-        
-        w0 = torch.tensor(w0_list, dtype=torch.float32)
-        w1 = torch.tensor(w1_list, dtype=torch.float32)
-        lengths_tensor = torch.tensor(chunk_lengths, dtype=torch.float32).clamp(min=1e-6)
-        log_norm_lengths = torch.log(lengths_tensor / length_scale)
-        
-        # T_c(L) = exp(w0_c + w1_c * log(L/S))
-        temps = torch.exp(w0.unsqueeze(0) + w1.unsqueeze(0) * log_norm_lengths.unsqueeze(1))
-        
-        # --- Top-Label Proportional Redistribution (Log-Odds) ---
-        raw_probs = torch.softmax(avg_logits, dim=-1)
-        pred_cls = torch.argmax(avg_logits, dim=-1)
-        n = avg_logits.shape[0]
-        idx = torch.arange(n)
-        
-        # Get the temperature specifically for the predicted class
-        top_temp = temps[idx, pred_cls]
-        
-        # Convert raw top probability to log-odds for BCE calibration
-        top_raw = raw_probs[idx, pred_cls]
-        top_raw_clamp = top_raw.clamp(min=1e-7, max=1.0 - 1e-7)
-        bce_logit = torch.log(top_raw_clamp / (1.0 - top_raw_clamp))
-        
-        # Calibrate the log-odds via temperature and sigmoid
-        cal_top = torch.sigmoid(bce_logit / top_temp)
-        
-        # Proportional redistribution for runner-up classes
-        remaining_raw = (1.0 - top_raw).clamp(min=1e-8)
-        remaining_cal = (1.0 - cal_top).clamp(min=0.0)
-        scale = (remaining_cal / remaining_raw).unsqueeze(1)
-        
-        final_probs = raw_probs * scale
-        final_probs[idx, pred_cls] = cal_top
-        
-        # Re-normalise to correct any floating-point drift
-        final_probs = final_probs / final_probs.sum(dim=-1, keepdim=True)
-        calibrated_probs = np.round(final_probs.numpy(), 4)
-        
-    else:
-        # Fallback if no calibration file is found
-        calibrated_probs = np.round(torch.softmax(avg_logits, dim=-1).numpy(), 4)
+    calibrated_probs = _apply_calibration(avg_logits, calib_params, chunk_lengths, num_classes)
+    for fold_data in per_fold_basic:
+        fold_data["probs"] = _apply_calibration(fold_data["logits"], calib_params, chunk_lengths, num_classes)
+    if args.verbose:
+        for fold_data in per_fold_verbose:
+            fold_data["probs"] = _apply_calibration(fold_data["logits"], calib_params, chunk_lengths, num_classes)
 
 
     class_cols = [label_mapping.get(i, f"class_{i}") for i in range(num_classes)]
