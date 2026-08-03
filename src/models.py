@@ -797,7 +797,7 @@ def load_model_and_tokenizer(
             else:
                 print("  Warning: No base_model weights found in checkpoint")
         else:
-            print(f"No checkpoint found. Using raw pre-trained base model.")
+            pass  # PEFT/LoRA inference — base model weights are pre-trained; fine-tuning is in the adapter
 
     pooling_layer = None
     if pooling == "learnable":

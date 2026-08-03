@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-V-HAMSTeR v1.2.0
+VHAMSTeR v1.2.0
 ==============================================================
-Virus Host Assignment Model using Sequence Transformers and Reading-frame.
+Virus Host Assignment Model using Sequence Transformers and Reading-frames.
 Runs 5-fold deep ensemble inference with per-fold XGBoost stacking 
 and applies length-aware continuous vector calibration.
 """
@@ -151,7 +151,7 @@ def _aggregate_chunks(
 
     genome_df = genome_df.with_columns([
         pl.Series("predicted_host", predicted_hosts),
-        pl.Series("confidence", confidences),
+        pl.Series("confidence", np.round(confidences, 4)),
     ])
 
     if prok_col_idx is not None:
@@ -196,7 +196,7 @@ def _configure_logging(output_dir: pathlib.Path, prefix: str) -> pathlib.Path:
 
 def _run(args: Any) -> None:
     logger.info("=" * 68)
-    logger.info(f"V-HAMSTeR v{__version__}")
+    logger.info(f"VHAMSTeR v{__version__}")
     logger.info("Virus Host Assignment Model using Sequence Transformers and Reading-frame")
     logger.info("=" * 68)
 
@@ -204,7 +204,8 @@ def _run(args: Any) -> None:
 
     # ── [1/5] Configuration & Pre-flight ─────────────────────────────────────
     ref_config = _load_fold_config(args.fold_dirs_resolved[0], args.checkpoint_subdir)
-    label_mapping = {int(k): str(v) for k, v in ref_config.get("label_mapping", {}).items()}
+    _LABEL_RENAMES = {"Metazoa (All Animals)": "Animal", "Viridiplantae (Plants)": "Plant"}
+    label_mapping = {int(k): _LABEL_RENAMES.get(str(v), str(v)) for k, v in ref_config.get("label_mapping", {}).items()}
     num_classes = len(label_mapping) if label_mapping else int(ref_config.get("num_classes", 5))
     model_type = ref_config.get("model_type", "nucleotidetransformer")
     max_length = int(ref_config.get("max_length", 10000))
@@ -259,6 +260,7 @@ def _run(args: Any) -> None:
     # ── [4/5] Ensemble Inference Loop ────────────────────────────────────────
     logger.info("[4/5] Running ensemble inference across folds")
     accumulated_logits: Optional[torch.Tensor] = None
+    per_fold_basic: List[Dict] = []
     per_fold_verbose: List[Dict] = [] if args.verbose else None
 
     for fold_idx, fold_dir in enumerate(args.fold_dirs_resolved, start=1):
@@ -412,23 +414,23 @@ def _run(args: Any) -> None:
                 else:
                     logits = classifier(**inputs)
                 fold_logits_list.append(logits.cpu())
-                if args.verbose and hasattr(classifier, '_last_alpha_batch'):
+                if hasattr(classifier, '_last_alpha_batch'):
                     alpha = np.atleast_1d(classifier._last_alpha_batch.flatten())
                     fold_alphas_list.append(alpha)
 
         fold_logits = torch.cat(fold_logits_list, dim=0)
+        fold_probs = np.round(F.softmax(fold_logits, dim=-1).numpy(), 4)
+        fold_alphas = np.round(
+            np.concatenate(fold_alphas_list) if fold_alphas_list else np.full(len(chunked_seqs), np.nan),
+            4,
+        )
+        per_fold_basic.append({"fold_name": fold_dir.name, "probs": fold_probs, "alphas": fold_alphas})
 
         if args.verbose:
-            fold_probs = np.round(F.softmax(fold_logits, dim=-1).numpy(), 4)
-            fold_alphas = (
-                np.concatenate(fold_alphas_list)
-                if fold_alphas_list
-                else np.full(len(chunked_seqs), np.nan)
-            )
             per_fold_verbose.append({
                 "fold_name": fold_dir.name,
                 "probs": fold_probs,
-                "alphas": np.round(fold_alphas, 4),
+                "alphas": fold_alphas,
                 "features": fold_features_dicts
             })
         if accumulated_logits is None:
@@ -518,6 +520,28 @@ def _run(args: Any) -> None:
         df_genomes.write_csv(args.genome_output, separator="\t")
         logger.info(f"Genome-level predictions written to: {args.genome_output}")
 
+    fold_rows: List[Dict] = []
+    for fold_data in per_fold_basic:
+        fold_probs = fold_data["probs"]
+        fold_alphas = fold_data["alphas"]
+        fold_pred_indices = np.argmax(fold_probs, axis=1)
+        fold_confidences = np.max(fold_probs, axis=1)
+        fold_predicted_hosts = [label_mapping.get(int(i), f"class_{i}") for i in fold_pred_indices]
+        for j, acc in enumerate(chunked_accs):
+            row: Dict = {
+                "accession": acc,
+                "fold": fold_data["fold_name"],
+                "predicted_host": fold_predicted_hosts[j],
+                "confidence": round(float(fold_confidences[j]), 4),
+                "glm_gate_weight": None if np.isnan(fold_alphas[j]) else round(float(fold_alphas[j]), 4),
+                **{col: round(float(fold_probs[j, i]), 4) for i, col in enumerate(class_cols)},
+            }
+            fold_rows.append(row)
+    df_folds = pl.DataFrame(fold_rows).sort(["accession", "fold"])
+    folds_path = args.output_dir / f"{args.prefix}.folds.tsv"
+    df_folds.write_csv(folds_path, separator="\t")
+    logger.info(f"Per-fold predictions written to: {folds_path}")
+
     if args.verbose and per_fold_verbose:
         verbose_rows = []
         for fold_data in per_fold_verbose:
@@ -554,14 +578,14 @@ def _run(args: Any) -> None:
 @click.option("--fasta", type=click.Path(path_type=pathlib.Path, exists=True, dir_okay=False), required=True, help="Input FASTA file.")
 @click.option("--output", type=click.Path(path_type=pathlib.Path, file_okay=False), required=True, help="Output directory.")
 @click.option("--prefix", default="vhamster", show_default=True, help="Base filename prefix for outputs.")
-@click.option("--force", "force", is_flag=True, help="Overwrite output if it exists.")
+@click.option("-f", "--force", "force", is_flag=True, help="Overwrite output if it exists.")
 @click.option("--ensemble-dir", type=click.Path(path_type=pathlib.Path), default=_DEFAULT_MODEL_ROOT, show_default=True, help="Root directory containing fold_* subdirs.")
 @click.option("--fold-dirs", type=click.Path(path_type=pathlib.Path), multiple=True, help="Explicit fold directories (overrides --ensemble-dir).")
 @click.option("--genomad-db", type=click.Path(path_type=pathlib.Path), default=None, help="geNomad MMseqs2 DB path.")
 @click.option("--num-folds", type=int, default=5, show_default=True, help="Number of folds to use.")
 @click.option("--fold-index", type=int, default=None, help="Use only one fold by index, e.g. 0..4.")
 @click.option("--checkpoint-subdir", default="best_macro_auprc_model", show_default=True, help="Checkpoint subdirectory name.")
-@click.option("--calibration-params", type=str, default=str(_DEFAULT_MODEL_ROOT / "length_aware_vector_scaling_anchors_5.json"), show_default=True, help="Path to length-aware vector scaling JSON.")
+@click.option("--calibration-params", type=str, default=str(_DEFAULT_MODEL_ROOT / "length_aware_vector_scaling_anchors_toplabel_5.json"), show_default=True, help="Path to length-aware vector scaling JSON.")
 @click.option("--chunk-size", type=int, default=10000, show_default=True, help="Chunk length in bp.")
 @click.option("--overlap", type=int, default=1000, show_default=True, help="Overlap between chunks in bp.")
 @click.option("--batch-size", type=int, default=16, show_default=True, help="Inference batch size.")
@@ -646,15 +670,15 @@ def main(
         args.fold_dirs_resolved = args.fold_dirs_resolved[: args.num_folds]
     args.num_folds = len(args.fold_dirs_resolved)
 
-    logger.info(f"Logging to: {log_path}")
-    _run(args)
-
     # Ensure calibration_params points to ensemble_dir if default site-packages path doesn't exist
     calib_path = pathlib.Path(calibration_params)
     if not calib_path.exists():
-        alt_calib = ensemble_dir / "length_aware_vector_scaling_anchors_5.json"
+        alt_calib = ensemble_dir / "length_aware_vector_scaling_anchors_toplabel_5.json"
         if alt_calib.exists():
             calibration_params = str(alt_calib)
+
+    logger.info(f"Logging to: {log_path}")
+    _run(args)
 
 
 if __name__ == "__main__":
