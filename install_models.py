@@ -21,13 +21,13 @@ from loguru import logger
 import click
 
 
-# Model configuration for v1.0.1
+# Model configuration for v1.2.0
 VERSION_DICTIONARY = {
-    "1.0.1": {
+    "1.2.0": {
         "md5": None,  # Will be calculated or user can provide
-        "db_url": "https://portal.nersc.gov/cfs/m342/V-HAMSTeR/vhamster_models_v1.0.1.tar.gz",
-        "dir_name": "vhamster_models_v1.0.1",
-        "expected_structure": ["best_params_20260331", "length_class_temperatures_continuous_brier.json"],
+        "db_url": "https://portal.nersc.gov/cfs/m342/V-HAMSTeR/vhamster_models_v1.2.0.tar.gz",
+        "dir_name": "vhamster_models_v1.2.0",
+        "expected_structure": ["fold_0", "fold_1", "fold_2", "fold_3", "fold_4", "length_aware_vector_scaling_anchors_toplabel_5.json"],
     }
 }
 
@@ -40,10 +40,10 @@ REQUIRED_MODEL_FILES = [
 ]
 
 REQUIRED_ROOT_FILES = [
-    "length_class_temperatures_continuous_brier.json",
+    "length_aware_vector_scaling_anchors_5.json",
 ]
 
-DEFAULT_MODEL_DIRNAME = "vhamster_models"
+DEFAULT_MODEL_DIRNAME = "vhamster_models_v1.2.0"
 
 
 def configure_logging(debug: bool = False):
@@ -65,7 +65,7 @@ def get_default_model_dir() -> str:
     return env_model_dir
 
 
-def instantiate_install(model_dir: str, force: bool = False, version: str = "1.0.1"):
+def instantiate_install(model_dir: str, force: bool = False, version: str = "1.2.0"):
     """
     Begin model install
 
@@ -112,7 +112,7 @@ def instantiate_dir(model_dir: str):
             sys.exit(1)
 
 
-def check_model_installation(model_dir: str, version: str = "1.0.1") -> bool:
+def check_model_installation(model_dir: str, version: str = "1.2.0") -> bool:
     """
     Check that all required models have been installed
 
@@ -130,16 +130,9 @@ def check_model_installation(model_dir: str, version: str = "1.0.1") -> bool:
             downloaded_flag = False
             break
     
-    # Check for ensemble directory
-    ensemble_dir = os.path.join(model_dir, "best_params_20260331")
-    if not os.path.isdir(ensemble_dir):
-        logger.warning("Ensemble directory 'best_params_20260331' not found")
-        downloaded_flag = False
-        return downloaded_flag
-    
     # Check for fold directories
     for fold_name in REQUIRED_MODEL_FILES:
-        fold_path = os.path.join(ensemble_dir, fold_name)
+        fold_path = os.path.join(model_dir, fold_name)
         if not os.path.isdir(fold_path):
             logger.warning(f"Fold directory missing: {fold_name}")
             downloaded_flag = False
@@ -273,7 +266,7 @@ def inspect_tarball(tarball_path: Path):
         }
 
 
-def untar(tarball_path: Path, output_path: str, version: str = "1.0.1"):
+def untar(tarball_path: Path, output_path: str, version: str = "1.2.0"):
     """
     Extract tarball and organize files into the expected directory structure
     """
@@ -345,28 +338,29 @@ def untar(tarball_path: Path, output_path: str, version: str = "1.0.1"):
         
         logger.info(f"Found source directory: {source_path}")
         
-        # Move best_params_20260331 and the calibration JSON into output_path
-        source_ensemble = os.path.join(source_path, "best_params_20260331")
-        source_temperature = os.path.join(source_path, "length_class_temperatures_continuous_brier.json")
-        
-        dest_ensemble = os.path.join(output_path, "best_params_20260331")
-        dest_temperature = os.path.join(output_path, "length_class_temperatures_continuous_brier.json")
-        
-        # Handle best_params_20260331
-        if os.path.exists(source_ensemble):
-            # Remove existing if force was used
-            if os.path.exists(dest_ensemble):
-                logger.info(f"Removing existing ensemble directory: {dest_ensemble}")
-                remove_directory(dest_ensemble)
+        calibration_file = VERSION_DICTIONARY[version]["calibration_file"]
+
+        # Move the 5 fold directories
+        for fold_name in REQUIRED_MODEL_FILES:
+            source_fold = os.path.join(source_path, fold_name)
+            dest_fold = os.path.join(output_path, fold_name)
             
-            logger.info(f"Moving ensemble directory from {source_ensemble} to {dest_ensemble}")
-            shutil.move(source_ensemble, dest_ensemble)
-        else:
-            logger.error(f"Ensemble directory not found: {source_ensemble}")
-            remove_directory(temp_extract_dir)
-            sys.exit("Ensemble directory 'best_params_20260331' not found in tarball")
-        
+            if os.path.exists(source_fold):
+                if os.path.exists(dest_fold):
+                    logger.info(f"Removing existing fold directory: {dest_fold}")
+                    remove_directory(dest_fold)
+                
+                logger.info(f"Moving fold directory from {source_fold} to {dest_fold}")
+                shutil.move(source_fold, dest_fold)
+            else:
+                logger.error(f"Fold directory not found: {source_fold}")
+                remove_directory(temp_extract_dir)
+                sys.exit(f"Fold directory '{fold_name}' not found in tarball")
+
         # Handle calibration JSON
+        source_temperature = os.path.join(source_path, calibration_file)
+        dest_temperature = os.path.join(output_path, calibration_file)
+        
         if os.path.exists(source_temperature):
             if os.path.exists(dest_temperature):
                 logger.info(f"Overwriting existing temperature file: {dest_temperature}")
@@ -376,7 +370,7 @@ def untar(tarball_path: Path, output_path: str, version: str = "1.0.1"):
             shutil.move(source_temperature, dest_temperature)
         else:
             logger.warning(f"Temperature file not found: {source_temperature}")
-        
+            
         # Clean up temporary directory
         logger.info(f"Cleaning up temporary directory: {temp_extract_dir}")
         remove_directory(temp_extract_dir)
@@ -399,7 +393,32 @@ def untar(tarball_path: Path, output_path: str, version: str = "1.0.1"):
         sys.exit(f"Extraction error: {e}")
 
 
-def get_models_nersc(model_dir: str, version: str = "1.0.1"):
+def download_genomad_db(model_dir: str):
+    """Uses the native geNomad CLI to download the database into the model directory."""
+    genomad_db_path = os.path.join(model_dir, "genomad_db")
+    
+    if os.path.exists(os.path.join(genomad_db_path, "genomad_marker_metadata.tsv")):
+        logger.info(f"geNomad database already exists at: {genomad_db_path}")
+        return
+
+    logger.info("="*60)
+    logger.info(f"Downloading geNomad database to: {genomad_db_path}")
+    logger.info("="*60)
+    
+    try:
+        # Calls the native genomad CLI command
+        sp.run(["genomad", "download-database", genomad_db_path], check=True)
+        logger.info("geNomad database downloaded successfully!")
+    except FileNotFoundError:
+        logger.error("The 'genomad' command was not found. Please ensure geNomad is installed in this environment.")
+        sys.exit(1)
+    except sp.CalledProcessError as e:
+        logger.error(f"Failed to download the geNomad database. Error: {e}")
+        sys.exit(1) 
+
+
+
+def get_models_nersc(model_dir: str, version: str = "1.2.0"):
     """
     Download vHAMSTeR models from NERSC portal
     
@@ -434,15 +453,17 @@ def get_models_nersc(model_dir: str, version: str = "1.0.1"):
     logger.info(f"Keeping tarball at {tarball_path}")
     
     # List models after installation
-    ensemble_dir = os.path.join(model_dir, "best_params_20260331")
-    if os.path.isdir(ensemble_dir):
-        fold_dirs = [d for d in os.listdir(ensemble_dir) if d.startswith("fold_")]
+    if os.path.isdir(model_dir):
+        fold_dirs = [d for d in os.listdir(model_dir) if d.startswith("fold_")]
         logger.info(f"Installed {len(fold_dirs)} fold models: {sorted(fold_dirs)}")
     
-    temperature_file = os.path.join(model_dir, "length_class_temperatures_continuous_brier.json")
+    calibration_file = VERSION_DICTIONARY[version]["calibration_file"]
+    temperature_file = os.path.join(model_dir, calibration_file)
     if os.path.exists(temperature_file):
         file_size = os.path.getsize(temperature_file) / (1024 * 1024)
-        logger.info(f"Length-class calibration file installed ({file_size:.2f} MB)")
+        logger.info(f"Length-aware calibration file installed ({file_size:.2f} MB)")
+
+    logger.info(f"  vhamster --fasta <input.fasta> --output <output_dir> --ensemble-dir {model_dir}")
     
     logger.info("Installation completed successfully!")
 
@@ -466,7 +487,7 @@ def get_models_nersc(model_dir: str, version: str = "1.0.1"):
     "-v",
     "--version",
     type=str,
-    default="1.0.1",
+    default="1.2.0",
     show_default=True,
     help="Version of vHAMSTeR models to install",
 )
@@ -500,28 +521,30 @@ def main(outdir, force, version, debug):
         logger.info("Force reinstall requested. Will reinstall models even if they exist.")
     
     instantiate_install(model_dir, force, version)
+
+    # Download the genomad database 
+    download_genomad_db(model_dir)
     
     # Final verification and summary
     logger.info("\n" + "="*60)
     logger.info("INSTALLATION SUMMARY")
     logger.info("="*60)
     
-    ensemble_dir = os.path.join(model_dir, "best_params_20260331")
-    if os.path.exists(ensemble_dir):
-        fold_dirs = [d for d in os.listdir(ensemble_dir) if d.startswith("fold_")]
-        logger.info(f"✓ Ensemble directory: {ensemble_dir}")
+    fold_dirs = [d for d in os.listdir(model_dir) if d.startswith("fold_")]
+    if len(fold_dirs) == 5:
         logger.info(f"✓ Fold models installed: {len(fold_dirs)}/5")
     else:
-        logger.warning(f"✗ Ensemble directory not found: {ensemble_dir}")
+        logger.warning(f"✗ Fold models missing. Found: {len(fold_dirs)}/5")
     
-    temperature_file = os.path.join(model_dir, "length_class_temperatures_continuous_brier.json")
+    calibration_file = VERSION_DICTIONARY[version]["calibration_file"]
+    temperature_file = os.path.join(model_dir, calibration_file)
     if os.path.exists(temperature_file):
-        logger.info(f"✓ Temperature file: {temperature_file}")
+        logger.info(f"✓ Calibration file: {temperature_file}")
     else:
-        logger.warning(f"✗ Temperature file not found: {temperature_file}")
+        logger.warning(f"✗ Calibration file not found: {temperature_file}")
     
     logger.info("\nTo use the models with vhamster:")
-    logger.info(f"  vhamster --fasta <input.fasta> --output <output_dir> --ensemble-dir {ensemble_dir}")
+    logger.info(f"  vhamster --fasta <input.fasta> --output <output_dir> --ensemble-dir {model_dir}")
     logger.info("="*60)
 
 

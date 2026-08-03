@@ -2,9 +2,11 @@ name: vhamster
 channels:
   - pytorch
   - nvidia
+  - bioconda
   - conda-forge
   - defaults
 dependencies:
+  - mmseqs2
   - python=3.11
   - pytorch=2.11
   - pytorch-cuda=12.1          # change to match your cluster's CUDA version

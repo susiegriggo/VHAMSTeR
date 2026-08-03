@@ -1,50 +1,39 @@
 #!/usr/bin/env python3
 """
-V-HAMSTeR 
+V-HAMSTeR v1.2.0
 ==============================================================
 Virus Host Assignment Model using Sequence Transformers and Reading-frame.
-Run inference using the full 5-fold deep ensemble and apply per-chunk
-length- and class-specific temperatures (from calibrate_length_aware.py)
-before converting logits to probabilities.
-
-Flow
-----
-1. Discover fold directories from --ensemble-dir or --fold-dirs.
-2. Read architecture / label / feature config from fold 0's config.json.
-3. Chunk input sequences and extract handcrafted features.
-4. For every fold model: load weights → run no-grad inference → get raw logits.
-5. Average raw logits across folds, then apply per-chunk (predicted_class,
-    length) temperatures from the length-class calibration JSON and compute
-    final probabilities via softmax.
-6. Write chunk-level TSV output in the same format as predict_genome.py.
-7. Aggregate chunks from the same parent genome by mean-pooling calibrated
-    class probabilities to produce genome-level consensus predictions.
+Runs 5-fold deep ensemble inference with per-fold XGBoost stacking 
+and applies length-aware continuous vector calibration.
 """
 
-__version__ = "1.0.1"
+__version__ = "1.2.0"
 
 import gc
 import json
 import multiprocessing
 import pathlib
+import pickle
 import re
 import sys
 import sysconfig
-from types import SimpleNamespace
 from concurrent.futures import ProcessPoolExecutor
-from typing import Dict, List, Optional, Tuple, Any, Union
+from types import SimpleNamespace
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import click
+import joblib
 import numpy as np
 import polars as pl
 import torch
 import torch.nn.functional as F
+import xgboost as xgb
 from loguru import logger
+from peft import PeftModel
 from torch import nn
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import AutoModel, AutoModelForMaskedLM, AutoTokenizer
-from peft import PeftModel
 
 # ── src/ on path ──────────────────────────────────────────────────────────────
 _ROOT = pathlib.Path(__file__).resolve().parent
@@ -52,21 +41,26 @@ _SRC = _ROOT / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from src.features import extract_features_worker
-from src.models import GenomeClassifier, make_collate_fn
-from src.sequences import GenomeDataset, load_fasta_sequences
-
-# ── local helper functions (self-contained; no external calibration dependency) ─
+from genomad_markers import extract_genomad_markers, write_annotation_rows
+from features import (
+    ARCH_FEATURE_NAMES,
+    build_xgb1_marker_features,
+    build_xgb2_marker_features,
+    extract_features_worker,
+)
+from models import GenomeClassifier, load_model_and_tokenizer, make_collate_fn
+from sequences import GenomeDataset, load_fasta_sequences
 
 
 def _default_model_root() -> pathlib.Path:
     purelib = sysconfig.get_path("purelib")
     if purelib is None:
         return _ROOT / "model"
-    return pathlib.Path(purelib) / "vhamster_models"
+    return pathlib.Path(purelib) / "vhamster_models_v1.2.0"
 
 
 _DEFAULT_MODEL_ROOT = _default_model_root()
+
 
 def _discover_fold_dirs(args: Any) -> List[pathlib.Path]:
     """Resolve fold directories from --fold-dirs or --ensemble-dir."""
@@ -86,21 +80,16 @@ def _discover_fold_dirs(args: Any) -> List[pathlib.Path]:
 
     fold_dirs = [p for p in ensemble_dir.iterdir() if p.is_dir() and p.name.startswith("fold_")]
     if not fold_dirs:
-        raise FileNotFoundError(
-            f"No fold_* directories found under {ensemble_dir}."
-        )
+        raise FileNotFoundError(f"No fold_* directories found under {ensemble_dir}.")
 
     def _fold_sort_key(p: pathlib.Path) -> Tuple[int, str]:
         m = re.search(r"fold_(\d+)$", p.name)
-        if m:
-            return int(m.group(1)), p.name
-        return 10**9, p.name
+        return (int(m.group(1)), p.name) if m else (10**9, p.name)
 
     return sorted(fold_dirs, key=_fold_sort_key)
 
 
 def _load_fold_config(fold_dir: pathlib.Path, checkpoint_subdir: str) -> Dict:
-    """Load config.json from fold root or checkpoint subdir."""
     candidates = [
         fold_dir / "config.json",
         fold_dir / checkpoint_subdir / "config.json",
@@ -109,69 +98,31 @@ def _load_fold_config(fold_dir: pathlib.Path, checkpoint_subdir: str) -> Dict:
         if cfg.exists():
             with open(cfg, "r", encoding="utf-8") as f:
                 return json.load(f)
-    raise FileNotFoundError(
-        f"No config.json found for fold {fold_dir}. Tried: {[str(c) for c in candidates]}"
-    )
+    raise FileNotFoundError(f"No config.json found for fold {fold_dir}. Tried: {[str(c) for c in candidates]}")
 
 
-def _build_base_model(model_name: str, model_type: str, max_length: int) -> nn.Module:
-    """Build base transformer model for inference."""
-    _ = max_length  # kept for API compatibility and future model-specific controls
-    if model_type == "modernbert":
-        return AutoModel.from_pretrained(model_name, trust_remote_code=True)
-    return AutoModelForMaskedLM.from_pretrained(model_name, trust_remote_code=True)
+def _load_calibration_params(path: Optional[Union[str, pathlib.Path]]) -> Optional[Dict]:
+    """Load vector scaling parameters (w0, w1, length_scale) from JSON."""
+    if path is None:
+        return None
+    p = pathlib.Path(str(path))
+    if not p.exists():
+        logger.warning(f"Calibration JSON not found: {p}. Using uncalibrated logits.")
+        return None
+    with open(p, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    logger.info(f"Loaded length-aware vector scaling parameters from {p}")
+    return data
 
 
-def _get_hidden_size(base_model: nn.Module) -> int:
-    """Infer hidden size from common config attributes."""
-    for attr in ("hidden_size", "d_model", "embed_dim"):
-        if hasattr(base_model.config, attr):
-            return int(getattr(base_model.config, attr))
-    return int(base_model.get_input_embeddings().weight.shape[1])
+def _reconstruct_hierarchical_probs(xgb1_probs, xgb2_probs, n_fine_classes, prokaryote_idx, euk_fine_indices):
+    out = np.zeros((xgb1_probs.shape[0], n_fine_classes), dtype=np.float32)
+    out[:, prokaryote_idx] = xgb1_probs[:, 0]
+    p_euk = xgb1_probs[:, 1]
+    for euk_col, fine_col in enumerate(euk_fine_indices):
+        out[:, fine_col] = p_euk * xgb2_probs[:, euk_col]
+    return out
 
-
-def _apply_feature_scaling(raw_features: List[List[float]], config: Dict) -> List[List[float]]:
-    """Apply training-time feature scaling when scaler stats are available."""
-    scaler_mean = config.get("feature_scaler_mean")
-    scaler_scale = config.get("feature_scaler_scale")
-    if not scaler_mean or not scaler_scale:
-        return raw_features
-
-    mean = np.asarray(scaler_mean, dtype=np.float32)
-    scale = np.asarray(scaler_scale, dtype=np.float32)
-    if mean.ndim != 1 or scale.ndim != 1:
-        return raw_features
-    if len(raw_features) == 0 or len(raw_features[0]) != mean.shape[0] or scale.shape[0] != mean.shape[0]:
-        return raw_features
-
-    arr = np.asarray(raw_features, dtype=np.float32)
-    safe_scale = np.where(scale == 0.0, 1.0, scale)
-    scaled = (arr - mean) / safe_scale
-    return scaled.tolist()
-
-
-# Keep feature schema consistent with predict_genome.py so ensemble output
-# includes the familiar per-chunk gene/RBS columns.
-DEFAULT_FEATURE_NAMES: List[str] = [
-    "fragment_size",
-    "strand_switch_rate",
-    "coding_density",
-    "leaderless_freq",
-    "short_utr_freq",
-    "no_rbs_freq",
-    "sd_bacteroidetes_rbs_freq",
-    "sd_canonical_rbs_freq",
-    "tatata_rbs_freq",
-    "mean_rbs_score",
-    "gene_density",
-    "gene_density_fwd",
-    "gene_density_rev",
-]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Chunk aggregation
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _aggregate_chunks(
     chunk_df: pl.DataFrame,
@@ -179,16 +130,7 @@ def _aggregate_chunks(
     prok_col_idx: Optional[int],
     label_mapping: Dict[int, str],
 ) -> pl.DataFrame:
-    """Mean-pool per-class probabilities across chunks to produce one row per
-    parent genome.  The parent genome ID is the accession with every
-    trailing '_chunk<start>_<end>' suffix stripped.
-
-    Mean-pooling over calibrated probability vectors (rather than majority
-    vote) is the correct aggregation because it preserves the full
-    uncertainty information captured by temperature scaling and the ensemble.
-    """
-    # Derive the parent genome ID: strip the trailing _chunk<int>_<int> suffix
-    # produced by _chunk_sequences(), leaving the original FASTA accession.
+    """Max-score weighted average of per-class probabilities across chunks."""
     genome_col = (
         pl.col("accession")
         .str.replace(r"_chunk\d+_\d+$", "", literal=False)
@@ -196,11 +138,12 @@ def _aggregate_chunks(
     )
     df = chunk_df.with_columns(genome_col)
 
-    # Average per-class probability columns across all chunks of the same genome.
-    agg_exprs = [pl.col(c).mean() for c in class_cols]
+    agg_exprs = [
+        ((pl.col(c) * pl.col("confidence")).sum() / pl.col("confidence").sum()).alias(c)
+        for c in class_cols
+    ]
     genome_df = df.group_by("genome").agg(agg_exprs).sort("genome")
 
-    # Re-derive predicted host and confidence from the averaged probabilities.
     prob_arr = genome_df.select(class_cols).to_numpy()
     pred_indices = np.argmax(prob_arr, axis=1)
     confidences = np.max(prob_arr, axis=1)
@@ -211,7 +154,6 @@ def _aggregate_chunks(
         pl.Series("confidence", confidences),
     ])
 
-    # Prokaryote / eukaryote convenience columns.
     if prok_col_idx is not None:
         prok_col_name = class_cols[prok_col_idx]
         genome_df = genome_df.with_columns([
@@ -219,226 +161,13 @@ def _aggregate_chunks(
             (pl.lit(1.0) - pl.col(prok_col_name)).alias("eukaryote_score"),
         ])
 
-    # Reorder columns: genome, predicted_host, confidence, class probs, extras.
     lead_cols = ["genome", "predicted_host", "confidence"]
-    rest = [c for c in genome_df.columns if c not in lead_cols]
-    genome_df = genome_df.select(lead_cols + rest)
-
-    return genome_df
+    #rest = [c for c in genome_df.columns if c not in lead_cols]
+    return genome_df.select(lead_cols)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _load_length_class_temperatures(
-    path: Optional[Union[str, pathlib.Path]],
-) -> Optional[Dict[int, Dict[int, float]]]:
-    """Load per-(class, length) temperatures from a JSON file produced by
-    calibrate_length_aware.py.
-
-    The JSON structure is ``{class_idx_str: {length_bin_str: temperature}}``.
-    Returns None if path is None or the file cannot be found.
-    """
-    if path is None:
-        return None
-    p = pathlib.Path(str(path))
-    if not p.exists():
-        logger.warning(f"Length-class temperature file not found: {p}. Using T=1.0 (uncalibrated).")
-        return None
-    with open(p, "r", encoding="utf-8") as f:
-        raw = json.load(f)
-    result: Dict[int, Dict[int, float]] = {
-        int(cls_key): {int(lb): float(t) for lb, t in bins.items()}
-        for cls_key, bins in raw.items()
-    }
-    logger.info(f"Loaded length-class temperatures: {len(result)} class(es) from {p}")
-    return result
-
-
-def _get_length_class_temperature(
-    length_class_temps: Optional[Dict[int, Dict[int, float]]],
-    predicted_class: int,
-    chunk_length: int,
-    fallback: float = 1.0,
-) -> float:
-    """Return the calibrated temperature for a given predicted class and chunk
-    length.  Nearest-bin matching is used so that chunk lengths between
-    calibration grid points map to the closest available temperature.
-    """
-    if length_class_temps is None:
-        return fallback
-    class_temps = length_class_temps.get(predicted_class)
-    if not class_temps:
-        return fallback
-    bins = sorted(class_temps.keys())
-    nearest_bin = min(bins, key=lambda b: abs(b - chunk_length))
-    return class_temps[nearest_bin]
-
-
-def _normalise_label_mapping(mapping: Dict) -> Dict[int, str]:
-    """Convert config label mapping keys to int and values to str."""
-    return {int(k): str(v) for k, v in (mapping or {}).items()}
-
-
-def _align_fold_probs_to_reference(
-    fold_probs: torch.Tensor,
-    fold_label_mapping: Dict[int, str],
-    ref_label_mapping: Dict[int, str],
-    fold_name: str,
-) -> torch.Tensor:
-    """Reorder one fold's [N, C] probabilities into reference class-index order.
-
-    This protects ensemble averaging from per-fold class-index drift.
-    """
-    if not ref_label_mapping or not fold_label_mapping:
-        return fold_probs
-
-    ref_order = [ref_label_mapping[i] for i in sorted(ref_label_mapping.keys())]
-    fold_order = [fold_label_mapping[i] for i in sorted(fold_label_mapping.keys())]
-
-    if ref_order == fold_order:
-        return fold_probs
-
-    fold_name_to_idx = {name: idx for idx, name in fold_label_mapping.items()}
-    reorder_idx: List[int] = []
-    missing_classes: List[str] = []
-    for ref_idx in sorted(ref_label_mapping.keys()):
-        class_name = ref_label_mapping[ref_idx]
-        if class_name not in fold_name_to_idx:
-            missing_classes.append(class_name)
-        else:
-            reorder_idx.append(fold_name_to_idx[class_name])
-
-    if missing_classes:
-        raise ValueError(
-            f"Fold {fold_name} is missing reference classes: {missing_classes}. "
-            "Cannot safely ensemble across folds with mismatched class sets."
-        )
-
-        logger.warning(
-            f"{fold_name} label index order differs from reference; "
-            "reordering fold probabilities by class name before averaging."
-        )
-    reorder_tensor = torch.tensor(reorder_idx, dtype=torch.long)
-    return fold_probs.index_select(dim=1, index=reorder_tensor)
-
-
-def _build_fold_classifier(
-    fold_dir: pathlib.Path,
-    checkpoint_subdir: str,
-    device: torch.device,
-) -> Tuple[nn.Module, AutoTokenizer, Dict]:
-    """Reconstruct one fold's GenomeClassifier from its config + checkpoint.
-
-    Loading path intentionally mirrors predict_genome.py:
-    1) inject LoRA adapters (if present)
-    2) load classifier_head.pt when available
-    3) otherwise fallback to training_state.pt model_state_dict
-    4) filter by key+shape and load non-strict
-    """
-    config = _load_fold_config(fold_dir, checkpoint_subdir)
-
-    model_name = config["model"]
-    tokenizer_name = config.get("tokenizer", model_name)
-    model_type = config.get("model_type", "nucleotidetransformer")
-    max_length = int(config.get("max_length", 10000))
-
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
-    if model_type == "bibert":
-        tokenizer.model_max_length = max_length
-
-    base_model = _build_base_model(model_name=model_name, model_type=model_type, max_length=max_length)
-    hidden_size = _get_hidden_size(base_model)
-
-    # Match predict_genome.py LoRA loading behavior.
-    ckpt_dir = fold_dir / checkpoint_subdir
-    if (ckpt_dir / "adapter_config.json").exists():
-        logger.info(f"LoRA adapters detected in {ckpt_dir.name}; injecting into base model...")
-        base_model = PeftModel.from_pretrained(base_model, ckpt_dir)
-    elif (fold_dir / "adapter_config.json").exists():
-        logger.info(f"LoRA adapters detected in {fold_dir.name}; injecting into base model...")
-        base_model = PeftModel.from_pretrained(base_model, fold_dir)
-
-    label_mapping = config.get("label_mapping", {})
-    num_classes = len(label_mapping) if label_mapping else int(config.get("num_classes", 5))
-    feature_names = config.get("feature_names") or []
-    feature_dim = len(feature_names)
-
-    classifier = GenomeClassifier(
-        base_model=base_model,
-        num_classes=num_classes,
-        hidden_size=hidden_size,
-        tokenizer=tokenizer,
-        pooling=config.get("pooling", "mean"),
-        model_type=model_type,
-        dropout=0.0,                              # no dropout at inference
-        feature_dim=feature_dim,
-        use_features=bool(config.get("use_features", True)),
-        use_glm=bool(config.get("use_glm", True)),
-        feature_integration_mode=config.get("feature_integration_mode", "concat"),
-        stream_weight_init=float(config.get("stream_weight_init", 0.0)),
-        use_learnable_aux_loss=bool(config.get("use_learnable_aux_loss", False)),
-        gate_hidden_dim=int(config.get("gate_hidden_dim", 64)),
-        max_length=max_length,
-    )
-
-    # Match predict_genome.py checkpoint selection behavior.
-    classifier_head_path = None
-    fallback_checkpoint = None
-    if (ckpt_dir / "classifier_head.pt").exists():
-        classifier_head_path = ckpt_dir / "classifier_head.pt"
-    elif (fold_dir / "classifier_head.pt").exists():
-        classifier_head_path = fold_dir / "classifier_head.pt"
-
-    possible_paths = [
-        ckpt_dir / "training_state.pt",
-        fold_dir / "training_state.pt",
-        fold_dir / "best_model" / "training_state.pt",
-    ]
-    for p in possible_paths:
-        if p.exists():
-            fallback_checkpoint = p
-            break
-
-    ckpt_state = None
-    if classifier_head_path is not None:
-        ckpt_state = torch.load(classifier_head_path, map_location="cpu")
-    elif fallback_checkpoint is not None:
-        checkpoint = torch.load(fallback_checkpoint, map_location="cpu")
-        ckpt_state = checkpoint.get("model_state_dict", checkpoint)
-    else:
-        raise FileNotFoundError(
-            f"No classifier weights found for fold {fold_dir}. Expected classifier_head.pt "
-            f"or training_state.pt under {ckpt_dir} / {fold_dir}."
-        )
-
-    # Filter and non-strict load to match predict_genome.py behavior.
-    model_state = classifier.state_dict()
-    filtered_state = {}
-    for key, value in ckpt_state.items():
-        if key in model_state and getattr(value, "shape", None) == model_state[key].shape:
-            filtered_state[key] = value
-
-    classifier.load_state_dict(filtered_state, strict=False)
-    logger.info(
-        f"Loaded {len(filtered_state)}/{len(ckpt_state)} checkpoint keys for {fold_dir.name}"
-    )
-
-    classifier.to(device)
-    classifier.eval()
-    return classifier, tokenizer, config
-
-
-def _chunk_sequences(
-    seqs: List[str],
-    accessions: List[str],
-    chunk_size: int,
-    overlap: int,
-) -> Tuple[List[str], List[str]]:
-    """Split sequences into overlapping chunks, same logic as predict_genome.py."""
-    chunked_seqs: List[str] = []
-    chunked_accs: List[str] = []
+def _chunk_sequences(seqs: List[str], accessions: List[str], chunk_size: int, overlap: int) -> Tuple[List[str], List[str]]:
+    chunked_seqs, chunked_accs = [], []
     for seq, acc in zip(seqs, accessions):
         seq_len = len(seq)
         if seq_len <= chunk_size:
@@ -456,72 +185,7 @@ def _chunk_sequences(
     return chunked_seqs, chunked_accs
 
 
-def _extract_features(
-    chunked_seqs: List[str],
-    chunked_accs: List[str],
-    feature_names: List[str],
-    chunk_size: int,
-    config: Dict,
-) -> Tuple[List[List[float]], Optional[List[List[float]]]]:
-    """Parallel feature extraction + scaler normalisation matching training."""
-    logger.info(f"{len(feature_names)} features x {len(chunked_seqs)} chunk(s)")
-    n_workers = min(multiprocessing.cpu_count(), len(chunked_seqs), 8)
-    args_list = [
-        (seq, acc, feature_names, chunk_size)
-        for seq, acc in zip(chunked_seqs, chunked_accs)
-    ]
-    chunksize = max(1, len(chunked_seqs) // (n_workers * 4))
-    with ProcessPoolExecutor(max_workers=n_workers) as ex:
-        raw_features = list(tqdm(
-            ex.map(extract_features_worker, args_list, chunksize=chunksize),
-            desc="      Extracting",
-            total=len(chunked_seqs),
-        ))
-    gc.collect()
-
-    # Apply the same StandardScaler that was fitted during training.
-    scaled = _apply_feature_scaling([list(f) for f in raw_features], config)
-    return raw_features, scaled
-
-
-@torch.inference_mode()
-def _collect_logits(
-    classifier: nn.Module,
-    dataloader: DataLoader,
-    device: torch.device,
-    use_fp16: bool,
-) -> torch.Tensor:
-    """Run inference for one fold; return raw logits [N, C] on CPU."""
-    logits_list: List[torch.Tensor] = []
-    for batch in tqdm(dataloader, desc="      Inference", leave=False):
-        input_ids = batch.get("input_ids")
-        attention_mask = batch.get("attention_mask")
-        features = batch.get("features")
-
-        if input_ids is not None:
-            input_ids = input_ids.to(device, non_blocking=True)
-        if attention_mask is not None:
-            attention_mask = attention_mask.to(device, non_blocking=True)
-        if features is not None:
-            features = features.to(device, non_blocking=True)
-
-        if use_fp16 and device.type == "cuda":
-            with torch.cuda.amp.autocast():
-                logits = classifier(input_ids=input_ids, attention_mask=attention_mask, features=features)
-        else:
-            logits = classifier(input_ids=input_ids, attention_mask=attention_mask, features=features)
-
-        logits_list.append(logits.detach().cpu().float())
-
-    return torch.cat(logits_list, dim=0)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CLI
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _configure_logging(output_dir: pathlib.Path, prefix: str) -> pathlib.Path:
-    """Configure loguru sinks for console + file in output directory."""
     output_dir.mkdir(parents=True, exist_ok=True)
     log_path = output_dir / f"{prefix}.log"
     logger.remove()
@@ -530,12 +194,7 @@ def _configure_logging(output_dir: pathlib.Path, prefix: str) -> pathlib.Path:
     return log_path
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _run(args: Any) -> None:
-
     logger.info("=" * 68)
     logger.info(f"V-HAMSTeR v{__version__}")
     logger.info("Virus Host Assignment Model using Sequence Transformers and Reading-frame")
@@ -543,167 +202,296 @@ def _run(args: Any) -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # ── Validate I/O ──────────────────────────────────────────────────────────
-    if not args.fasta.is_file():
-        sys.exit(f"ERROR: FASTA file not found: {args.fasta}")
-
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    if args.output.exists() and not args.force:
-        sys.exit(
-            f"ERROR: Output file already exists: {args.output}\n"
-            "       Use --force / -f to overwrite."
-        )
-
-    if args.aggregate_chunks and args.genome_output is not None:
-        args.genome_output.parent.mkdir(parents=True, exist_ok=True)
-        if args.genome_output.exists() and not args.force:
-            sys.exit(
-                f"ERROR: Genome output file already exists: {args.genome_output}\n"
-                "       Use --force / -f to overwrite."
-            )
-
-    if args.overlap >= args.chunk_size:
-        sys.exit("ERROR: --overlap must be smaller than --chunk-size.")
-
-    # ── [1/5] Configuration ───────────────────────────────────────────────────
-    logger.info("[1/5] Loading configuration")
-    logger.info(f"Fold directories: {[str(p) for p in args.fold_dirs_resolved]}")
-    logger.info(f"Device: {device}")
-
-    # All folds share the same training config; use fold 0 as the reference.
+    # ── [1/5] Configuration & Pre-flight ─────────────────────────────────────
     ref_config = _load_fold_config(args.fold_dirs_resolved[0], args.checkpoint_subdir)
+    label_mapping = {int(k): str(v) for k, v in ref_config.get("label_mapping", {}).items()}
+    num_classes = len(label_mapping) if label_mapping else int(ref_config.get("num_classes", 5))
+    model_type = ref_config.get("model_type", "nucleotidetransformer")
+    max_length = int(ref_config.get("max_length", 10000))
 
-    feature_names: List[str] = ref_config.get("feature_names") or DEFAULT_FEATURE_NAMES
-    use_features: bool = bool(ref_config.get("use_features", True)) and len(feature_names) > 0
-    label_mapping: Dict[int, str] = _normalise_label_mapping(ref_config.get("label_mapping", {}))
-    num_classes: int = len(label_mapping) if label_mapping else int(ref_config.get("num_classes", 5))
-    model_type: str = ref_config.get("model_type", "nucleotidetransformer")
-    max_length: int = int(ref_config.get("max_length", 10000))
-    feature_integration_mode: str = ref_config.get("feature_integration_mode", "concat")
+    calib_params = _load_calibration_params(args.calibration_params)
 
-    logger.info(f"Classes: {num_classes} ({list(label_mapping.values())})")
-    logger.info(f"Architecture: {model_type}")
-    logger.info(f"Feature stream: {use_features} ({len(feature_names)} features)")
-    logger.info(f"Integration mode: {feature_integration_mode}")
-
-    length_class_temps = _load_length_class_temperatures(args.length_class_temperatures)
-    if length_class_temps is not None:
-        logger.info(f"Length-class temperatures loaded: {len(length_class_temps)} class(es)")
-    else:
-        logger.warning("No length-class temperature file found; using T=1.0 (uncalibrated).")
-
-    # ── [2/5] Chunking ────────────────────────────────────────────────────────
+    # ── [2/5] Sequence Chunking ──────────────────────────────────────────────
     logger.info("[2/5] Loading and chunking sequences")
     seqs, accessions = load_fasta_sequences(str(args.fasta))
     chunked_seqs, chunked_accs = _chunk_sequences(seqs, accessions, args.chunk_size, args.overlap)
-    logger.info(
-        f"{len(accessions)} sequence(s) -> {len(chunked_seqs)} chunk(s) "
-        f"(chunk: {args.chunk_size:,} bp, overlap: {args.overlap:,} bp)"
-    )
+    logger.info(f"{len(accessions)} sequence(s) -> {len(chunked_seqs)} chunk(s)")
 
-    # ── [3/5] Feature extraction ──────────────────────────────────────────────
-    logger.info("[3/5] Extracting gene features")
-    raw_features: Optional[List[List[float]]] = None
-    scaled_features: Optional[List[List[float]]] = None
+    # ── [3/5] Global Feature Extraction (PyRodigal & geNomad MMseqs2) ────────
+    logger.info("[3/5] Extracting global architectural features & geNomad hits")
+    
+    # 3a. PyRodigal
+    arch_feature_names = list(ARCH_FEATURE_NAMES) + ["n_genes"]
+    n_workers = min(multiprocessing.cpu_count(), len(chunked_seqs), 8)
+    args_list = [(s, a, False, arch_feature_names, args.chunk_size) for s, a in zip(chunked_seqs, chunked_accs)]
+    with ProcessPoolExecutor(max_workers=n_workers) as ex:
+        raw_arch_features = list(tqdm(ex.map(extract_features_worker, args_list), total=len(chunked_seqs), desc="      PyRodigal"))
 
-    if use_features:
-        raw_features, scaled_features = _extract_features(
-            chunked_seqs=chunked_seqs,
-            chunked_accs=chunked_accs,
-            feature_names=feature_names,
-            chunk_size=args.chunk_size,
-            config=ref_config,
+    raw_arch_array = np.array(raw_arch_features, dtype=np.float32)
+    features_df_arch = pl.DataFrame(raw_arch_array, schema=arch_feature_names)
+    arch_cols_no_frag = [c for c in ARCH_FEATURE_NAMES if c != "fragment_size"]
+
+    # 3b. geNomad MMseqs2
+    genomad_metadata = args.genomad_db / "genomad_marker_metadata.tsv"
+    if not genomad_metadata.exists():
+        raise FileNotFoundError(
+            f"geNomad metadata file not found at expected location: {genomad_metadata}\n"
+            "Ensure you are passing the root directory of a complete geNomad database."
         )
-    else:
-        logger.info("Feature stream disabled; skipping.")
 
-    # ── [4/5] Ensemble inference ──────────────────────────────────────────────
-    logger.info("[4/5] Running ensemble inference")
+    logger.info("      Running MMseqs2 against geNomad marker database...")
+    seq_dict = dict(zip(chunked_accs, chunked_seqs))
 
-    # Build one shared tokenizer + dataset/dataloader from the reference config.
-    ref_tokenizer = AutoTokenizer.from_pretrained(
-        ref_config.get("tokenizer", ref_config["model"]), trust_remote_code=True
+    # Update the function call to request details 
+    marker_hits, _, annotation_rows = extract_genomad_markers(
+        sequences=seq_dict,
+        genomad_db=args.genomad_db,
+        genomad_metadata=genomad_metadata,
+        return_details=True  # Request detailed output for verbose logging
     )
-    if model_type == "bibert":
-        ref_tokenizer.model_max_length = max_length
+    genomad_marker_dict = marker_hits 
 
-    dataset = GenomeDataset(
-        sequences=chunked_seqs,
-        labels=[0] * len(chunked_seqs),        # dummy labels; not used in inference
-        accessions=chunked_accs,
-        tokenizer=ref_tokenizer,
-        max_length=max_length,
-        model_type=model_type,
-        features=scaled_features,
-        token_pooling=ref_config.get("pooling", "mean"),
-    )
-    collate_fn = make_collate_fn(ref_tokenizer, model_type, max_length)
-    dataloader_kwargs = dict(
-        batch_size=args.batch_size,
-        shuffle=False,
-        collate_fn=collate_fn,
-        num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
-    )
-    if args.num_workers > 0:
-        dataloader_kwargs["persistent_workers"] = True
-
-    dataloader = DataLoader(dataset, **dataloader_kwargs)
-
-    # Accumulate raw logits across folds, then average and apply per-chunk
-    # (predicted_class, length) temperatures from the length-class calibration.
-    # Averaging logits first and then applying a single per-chunk temperature is
-    # consistent with how calibrate_length_aware.py fitted temperatures against
-    # the ensemble's averaged logit predictions.
+    # write a gene prediction table 
+    gene_table_path = args.output_dir / f"{args.prefix}.gene_predictions.tsv"
+    write_annotation_rows(annotation_rows, gene_table_path)
+    logger.info(f"      Gene prediction table written to: {gene_table_path}")
+    
+    # ── [4/5] Ensemble Inference Loop ────────────────────────────────────────
+    logger.info("[4/5] Running ensemble inference across folds")
     accumulated_logits: Optional[torch.Tensor] = None
+    per_fold_verbose: List[Dict] = [] if args.verbose else None
 
     for fold_idx, fold_dir in enumerate(args.fold_dirs_resolved, start=1):
-        logger.info(f"Fold {fold_idx}/{args.num_folds}: {fold_dir.name}")
-        classifier, _, fold_config = _build_fold_classifier(fold_dir, args.checkpoint_subdir, device)
+        logger.info(f"--- Fold {fold_idx}/{len(args.fold_dirs_resolved)}: {fold_dir.name} ---")
+        fold_config = _load_fold_config(fold_dir, args.checkpoint_subdir)
+        
+        # 4a. Locate Fold Stacking Artifacts
+        xgb_artifacts_dir = fold_dir / "xgb_stacking_artifacts"
+        xgb_spec_path = xgb_artifacts_dir / "xgb_stacking_artifacts.json"
+        if not xgb_spec_path.exists():
+            raise FileNotFoundError(f"Missing XGBoost artifacts in fold {fold_dir.name}: {xgb_spec_path}")
 
-        # Raw logits from this fold's model [N, C]
-        fold_logits = _collect_logits(classifier, dataloader, device, args.fp16)
+        with open(xgb_spec_path) as f:
+            xgb_spec = json.load(f)
 
-        # Align fold logits to reference class order before accumulating;
-        # protects against per-fold label index drift.
-        fold_label_mapping = _normalise_label_mapping(fold_config.get("label_mapping", {}))
-        fold_logits = _align_fold_probs_to_reference(
-            fold_probs=fold_logits,
-            fold_label_mapping=fold_label_mapping,
-            ref_label_mapping=label_mapping,
-            fold_name=fold_dir.name,
+        spec_pkl_path = xgb_artifacts_dir / xgb_spec.get("specificity_pkl", "marker_classification.pkl")
+        cutoff_pkl_path = xgb_artifacts_dir / xgb_spec.get("cutoff_pkl", "marker_cutoffs.pkl")
+        
+        with open(spec_pkl_path, "rb") as fh:
+            marker_classification = pickle.load(fh)
+        with open(cutoff_pkl_path, "rb") as fh:
+            cutoff_dict = pickle.load(fh)
+
+        # 4b. Compute Fold-Specific XGBoost Marker Features
+        marker_hits = genomad_marker_dict or {}
+        xgb1_mf_df = build_xgb1_marker_features(chunked_accs, marker_hits, marker_classification, cutoff_dict, features_df_arch)
+        xgb2_mf_df = build_xgb2_marker_features(chunked_accs, marker_hits, marker_classification, cutoff_dict, features_df_arch)
+
+        # 4c. Load & Run Fold XGBoost Models
+        xgb1_booster = xgb.Booster()
+        xgb2_booster = xgb.Booster()
+        xgb1_booster.load_model(str(xgb_artifacts_dir / xgb_spec["xgb1_model"]))
+        xgb2_booster.load_model(str(xgb_artifacts_dir / xgb_spec["xgb2_model"]))
+
+        xgb_arch_df = features_df_arch.select(arch_cols_no_frag).fill_null(0.0)
+        x_all_df = pl.concat([xgb_arch_df, xgb1_mf_df], how="horizontal")
+        x_euk_df = pl.concat([xgb_arch_df, xgb2_mf_df], how="horizontal")
+
+        # Add a combine feature dictionary for this fold 
+        unique_euk_cols = [c for c in x_euk_df.columns if c not in x_all_df.columns]
+        fold_features_df = pl.concat([x_all_df, x_euk_df.select(unique_euk_cols)], how="horizontal")
+        fold_features_dicts = fold_features_df.to_dicts()
+
+        exp_xgb1 = xgb1_booster.feature_names
+        exp_xgb2 = xgb2_booster.feature_names
+        x_all = x_all_df.select(exp_xgb1).to_numpy() if exp_xgb1 else x_all_df.to_numpy()
+        x_euk = x_euk_df.select(exp_xgb2).to_numpy() if exp_xgb2 else x_euk_df.to_numpy()
+
+        raw1 = xgb1_booster.predict(xgb.DMatrix(x_all))
+        xgb1_probs = np.column_stack([1.0 - raw1, raw1]) if raw1.ndim == 1 else raw1
+
+        raw2 = xgb2_booster.predict(xgb.DMatrix(x_euk))
+        xgb2_probs = np.column_stack([1.0 - raw2, raw2]) if raw2.ndim == 1 else raw2
+
+        xgb_probs = _reconstruct_hierarchical_probs(
+            xgb1_probs, xgb2_probs,
+            int(xgb_spec["n_fine_classes"]),
+            int(xgb_spec["prokaryote_idx"]),
+            [int(i) for i in xgb_spec["euk_fine_indices"]],
         )
 
+        # 4d. Build Combined Feature Matrix & Gate Inputs
+        gate_marker_dim = int(fold_config.get("gate_marker_dim", 0))
+        if gate_marker_dim > 0:
+            n_genes_array = features_df_arch.select("n_genes").to_numpy()
+            fold_features = np.concatenate([xgb_probs, n_genes_array], axis=1)
+        else:
+            fold_features = xgb_probs
+
+        raw_feature_dim = int(fold_config.get("raw_feature_dim", 0))
+        if raw_feature_dim == (len(arch_cols_no_frag) + len(xgb1_mf_df.columns)):
+            raw_gate_features = pl.concat([xgb_arch_df, xgb1_mf_df], how="horizontal").to_numpy()
+        else:
+            raw_gate_features = xgb_arch_df.to_numpy()
+
+        # 4e. Apply Scaler if present
+        scaler_path = xgb_artifacts_dir / "feature_scaler.joblib"
+        if scaler_path.exists():
+            scaler = joblib.load(scaler_path)
+            fold_features = scaler.transform(fold_features)
+
+        # 4f. Load Fold Transformer & Predict
+        model_artifact_dir = fold_dir / args.checkpoint_subdir
+        tokenizer = AutoTokenizer.from_pretrained(fold_config.get("tokenizer", fold_config["model"]), trust_remote_code=True)
+        if model_type == "bibert":
+            tokenizer.model_max_length = max_length
+
+        base_model, _, _, _, hidden_size = load_model_and_tokenizer(
+            model_path=str(fold_dir),
+            model_type=model_type,
+            pooling=fold_config.get("pooling", "mean"),
+            max_length=max_length,
+            base_model_name=fold_config.get("model"),
+        )
+
+        if (model_artifact_dir / "adapter_config.json").exists():
+            base_model = PeftModel.from_pretrained(base_model, model_artifact_dir)
+
+        classifier = GenomeClassifier(
+            base_model=base_model,
+            num_classes=num_classes,
+            hidden_size=hidden_size,
+            tokenizer=tokenizer,
+            pooling=fold_config.get("pooling", "mean"),
+            model_type=model_type,
+            dropout=0.0,
+            feature_dim=fold_features.shape[1],
+            xgb_feature_dim=num_classes,
+            gate_marker_dim=gate_marker_dim,
+            use_features=True,
+            use_glm=bool(fold_config.get("use_glm", True)),
+            feature_integration_mode=fold_config.get("feature_integration_mode", "stacking"),
+            gate_hidden_dim=int(fold_config.get("gate_hidden_dim", 64)),
+            raw_feature_dim=raw_feature_dim,
+        ).to(device)
+
+        ckpt_path = model_artifact_dir / "classifier_head.pt"
+        if not ckpt_path.exists():
+            ckpt_path = fold_dir / "classifier_head.pt"
+        ckpt_state = torch.load(ckpt_path, map_location=device)
+        classifier.load_state_dict(ckpt_state, strict=False)
+        classifier.eval()
+
+        # Build DataLoader
+        dataset = GenomeDataset(
+            sequences=chunked_seqs,
+            labels=[0] * len(chunked_seqs),
+            features=fold_features.tolist(),
+            accessions=chunked_accs,
+            tokenizer=tokenizer,
+            max_length=max_length,
+            model_type=model_type,
+            token_pooling=fold_config.get("pooling", "mean"),
+            raw_features=raw_gate_features.tolist(),
+        )
+        dataloader = DataLoader(
+            dataset, batch_size=args.batch_size, shuffle=False,
+            collate_fn=make_collate_fn(tokenizer, model_type, max_length),
+            num_workers=args.num_workers, pin_memory=(device.type == "cuda")
+        )
+
+        # Collect Logits
+        fold_logits_list = []
+        fold_alphas_list = []
+        with torch.no_grad():
+            for batch in tqdm(dataloader, desc=f"      Inference", leave=False):
+                inputs = {k: v.to(device) for k, v in batch.items() if k not in {'accession', 'labels'}}
+                if args.fp16 and device.type == 'cuda':
+                    with torch.cuda.amp.autocast():
+                        logits = classifier(**inputs)
+                else:
+                    logits = classifier(**inputs)
+                fold_logits_list.append(logits.cpu())
+                if args.verbose and hasattr(classifier, '_last_alpha_batch'):
+                    alpha = np.atleast_1d(classifier._last_alpha_batch.flatten())
+                    fold_alphas_list.append(alpha)
+
+        fold_logits = torch.cat(fold_logits_list, dim=0)
+
+        if args.verbose:
+            fold_probs = np.round(F.softmax(fold_logits, dim=-1).numpy(), 4)
+            fold_alphas = (
+                np.concatenate(fold_alphas_list)
+                if fold_alphas_list
+                else np.full(len(chunked_seqs), np.nan)
+            )
+            per_fold_verbose.append({
+                "fold_name": fold_dir.name,
+                "probs": fold_probs,
+                "alphas": np.round(fold_alphas, 4),
+                "features": fold_features_dicts
+            })
         if accumulated_logits is None:
             accumulated_logits = fold_logits.clone()
         else:
-            accumulated_logits = accumulated_logits + fold_logits
+            accumulated_logits += fold_logits
 
-        # Free GPU memory before loading the next fold.
-        del classifier
-        if device.type == "cuda":
+        del classifier, base_model
+        if device.type == 'cuda':
             torch.cuda.empty_cache()
         gc.collect()
 
-    # Average logits across folds, then apply per-chunk length-class temperatures.
-    avg_logits = accumulated_logits / args.num_folds  # [N, C]
-    
+    # ── [5/5] Post-Ensemble Vector Calibration & Aggregation ────────────────
+    logger.info("[5/5] Applying length-aware vector calibration & chunk aggregation")
+    avg_logits = accumulated_logits / len(args.fold_dirs_resolved)
     chunk_lengths = [len(s) for s in chunked_seqs]
-    pred_classes_for_temp = avg_logits.argmax(dim=1).tolist()
-    temps_per_chunk = torch.tensor(
-        [
-            _get_length_class_temperature(length_class_temps, int(c), cl)
-            for c, cl in zip(pred_classes_for_temp, chunk_lengths)
-        ],
-        dtype=torch.float32,
-    ).unsqueeze(1)  # [N, 1] for broadcasting
-    calibrated_probs: np.ndarray = F.softmax(avg_logits / temps_per_chunk, dim=-1).numpy()  # [N, C]
 
-    # The DataLoader uses shuffle=False, so accession order matches chunked_accs exactly.
-    all_accessions = chunked_accs
+    if calib_params and "classes" in calib_params:
+        length_scale = float(calib_params.get("length_scale", 1000.0))
+        w0_list = [calib_params["classes"].get(str(c), {"w0": 0.0})["w0"] for c in range(num_classes)]
+        w1_list = [calib_params["classes"].get(str(c), {"w1": 0.0})["w1"] for c in range(num_classes)]
+        
+        w0 = torch.tensor(w0_list, dtype=torch.float32)
+        w1 = torch.tensor(w1_list, dtype=torch.float32)
+        lengths_tensor = torch.tensor(chunk_lengths, dtype=torch.float32).clamp(min=1e-6)
+        log_norm_lengths = torch.log(lengths_tensor / length_scale)
+        
+        # T_c(L) = exp(w0_c + w1_c * log(L/S))
+        temps = torch.exp(w0.unsqueeze(0) + w1.unsqueeze(0) * log_norm_lengths.unsqueeze(1))
+        
+        # --- Top-Label Proportional Redistribution (Log-Odds) ---
+        raw_probs = torch.softmax(avg_logits, dim=-1)
+        pred_cls = torch.argmax(avg_logits, dim=-1)
+        n = avg_logits.shape[0]
+        idx = torch.arange(n)
+        
+        # Get the temperature specifically for the predicted class
+        top_temp = temps[idx, pred_cls]
+        
+        # Convert raw top probability to log-odds for BCE calibration
+        top_raw = raw_probs[idx, pred_cls]
+        top_raw_clamp = top_raw.clamp(min=1e-7, max=1.0 - 1e-7)
+        bce_logit = torch.log(top_raw_clamp / (1.0 - top_raw_clamp))
+        
+        # Calibrate the log-odds via temperature and sigmoid
+        cal_top = torch.sigmoid(bce_logit / top_temp)
+        
+        # Proportional redistribution for runner-up classes
+        remaining_raw = (1.0 - top_raw).clamp(min=1e-8)
+        remaining_cal = (1.0 - cal_top).clamp(min=0.0)
+        scale = (remaining_cal / remaining_raw).unsqueeze(1)
+        
+        final_probs = raw_probs * scale
+        final_probs[idx, pred_cls] = cal_top
+        
+        # Re-normalise to correct any floating-point drift
+        final_probs = final_probs / final_probs.sum(dim=-1, keepdim=True)
+        calibrated_probs = np.round(final_probs.numpy(), 4)
+        
+    else:
+        # Fallback if no calibration file is found
+        calibrated_probs = np.round(torch.softmax(avg_logits, dim=-1).numpy(), 4)
 
-    # ── [5/5] Writing output ──────────────────────────────────────────────────
-    logger.info("[5/5] Writing results")
 
     class_cols = [label_mapping.get(i, f"class_{i}") for i in range(num_classes)]
     pred_indices = np.argmax(calibrated_probs, axis=1)
@@ -711,90 +499,55 @@ def _run(args: Any) -> None:
     predicted_hosts = [label_mapping.get(int(i), f"class_{i}") for i in pred_indices]
 
     data_dict: Dict = {
-        "accession": all_accessions,
+        "accession": chunked_accs,
         "predicted_host": predicted_hosts,
         "confidence": confidences.tolist(),
         **{col: calibrated_probs[:, i].tolist() for i, col in enumerate(class_cols)},
     }
 
-    # Convenience prokaryote/eukaryote summary columns (matches predict_genome.py).
-    prok_col_idx: Optional[int] = None
-    for idx, name in label_mapping.items():
-        if "prokaryote" in name.lower():
-            prok_col_idx = int(idx)
-            break
+    prok_col_idx = next((int(i) for i, n in label_mapping.items() if "prokaryote" in n.lower()), None)
     if prok_col_idx is not None:
         data_dict["prokaryote_score"] = calibrated_probs[:, prok_col_idx].tolist()
         data_dict["eukaryote_score"] = (1.0 - calibrated_probs[:, prok_col_idx]).tolist()
 
-    # Append raw (unscaled) feature values for interpretability.
-    # Use the canonical predict_genome feature schema when possible so columns
-    # are stable across single-model and ensemble predictions.
-    if use_features and raw_features and len(raw_features) == len(all_accessions):
-        acc_to_bp = {acc: len(seq) for acc, seq in zip(chunked_accs, chunked_seqs)}
-        raw_feature_map = {fname: i for i, fname in enumerate(feature_names)}
-        output_feature_names = [
-            f for f in DEFAULT_FEATURE_NAMES if f in raw_feature_map
-        ]
-        for fname in output_feature_names:
-            if fname == "fragment_size":
-                data_dict["fragment_size_bp"] = [int(acc_to_bp.get(a, 0)) for a in all_accessions]
-            else:
-                i = raw_feature_map[fname]
-                data_dict[fname] = [float(f[i]) for f in raw_features]
+    df_chunks = pl.DataFrame(data_dict).sort("accession")
+    df_chunks.write_csv(args.output, separator="\t")
 
-    df = pl.DataFrame(data_dict)
-    df = df.sort("accession")
-    float_cols = [c for c, dt in zip(df.columns, df.dtypes) if dt in (pl.Float32, pl.Float64)]
-    if float_cols:
-        df = df.with_columns([pl.col(c).round(4) for c in float_cols])
-    df.write_csv(args.output, separator="\t")
-
-    # ── Optional genome-level aggregation ────────────────────────────────────
-    genome_df: Optional[pl.DataFrame] = None
     if args.aggregate_chunks:
-        logger.info("Aggregating chunk predictions -> genome-level consensus")
-        logger.info("Method: mean-pool calibrated class probabilities per parent genome")
-        genome_df = _aggregate_chunks(
-            chunk_df=df,
-            class_cols=class_cols,
-            prok_col_idx=prok_col_idx,
-            label_mapping=label_mapping,
-        )
-        genome_float_cols = [
-            c for c, dt in zip(genome_df.columns, genome_df.dtypes)
-            if dt in (pl.Float32, pl.Float64)
-        ]
-        if genome_float_cols:
-            genome_df = genome_df.with_columns(
-                [pl.col(c).round(4) for c in genome_float_cols]
-            )
-        args.genome_output.parent.mkdir(parents=True, exist_ok=True)
-        genome_df.write_csv(args.genome_output, separator="\t")
-        logger.info(f"Genome-level output: {args.genome_output}")
+        df_genomes = _aggregate_chunks(df_chunks, class_cols, prok_col_idx, label_mapping)
+        df_genomes.write_csv(args.genome_output, separator="\t")
+        logger.info(f"Genome-level predictions written to: {args.genome_output}")
 
-    # ── Summary ───────────────────────────────────────────────────────────────
-    logger.info("=" * 68)
+    if args.verbose and per_fold_verbose:
+        verbose_rows = []
+        for fold_data in per_fold_verbose:
+            fold_probs = fold_data["probs"]
+            fold_alphas = fold_data["alphas"]
+            fold_pred_indices = np.argmax(fold_probs, axis=1)
+            fold_confidences = np.max(fold_probs, axis=1)
+            fold_predicted_hosts = [label_mapping.get(int(i), f"class_{i}") for i in fold_pred_indices]
+            for j, acc in enumerate(chunked_accs):
+                row: Dict = {
+                    "accession": acc,
+                    "fold": fold_data["fold_name"],
+                    "predicted_host": fold_predicted_hosts[j],
+                    "confidence": float(fold_confidences[j]),
+                    "glm_gate_weight": None if np.isnan(fold_alphas[j]) else float(fold_alphas[j]),
+                }
+                for i, col in enumerate(class_cols):
+                    row[col] = float(fold_probs[j, i])
+
+                # inject all architecture and marker features 
+                row.update(fold_data["features"][j] )
+
+                verbose_rows.append(row)
+
+        df_verbose = pl.DataFrame(verbose_rows).sort(["accession", "fold"])
+        verbose_path = args.output_dir / f"{args.prefix}.verbose.tsv"
+        df_verbose.write_csv(verbose_path, separator="\t")
+        logger.info(f"Verbose per-fold predictions written to: {verbose_path}")
+
     logger.info("Done!")
-    logger.info(f"Sequences processed: {len(accessions)}")
-    logger.info(f"Chunks processed: {len(chunked_seqs)}")
-    logger.info(f"Folds used: {args.num_folds}")
-    logger.info(f"Calibration: length-class temperatures ({args.length_class_temperatures})")
-    logger.info(f"Chunk output: {args.output}")
-    if prok_col_idx is not None:
-        n_prok = sum(1 for h in predicted_hosts if "prokaryote" in h.lower())
-        logger.info(f"Prokaryotic chunks: {n_prok}")
-        logger.info(f"Eukaryotic chunks: {len(predicted_hosts) - n_prok}")
-    if genome_df is not None:
-        genome_preds = genome_df["predicted_host"].to_list()
-        logger.info(f"Genome output: {args.genome_output}")
-        logger.info("Consensus mode: mean-pooled calibrated probabilities")
-        logger.info(f"Genomes predicted: {len(genome_preds)}")
-        if prok_col_idx is not None:
-            n_prok_g = sum(1 for h in genome_preds if "prokaryote" in h.lower())
-            logger.info(f"Prokaryotic genomes: {n_prok_g}")
-            logger.info(f"Eukaryotic genomes: {len(genome_preds) - n_prok_g}")
-    logger.info("=" * 68)
 
 
 @click.command(context_settings={"help_option_names": ["-h", "--help"]})
@@ -802,19 +555,20 @@ def _run(args: Any) -> None:
 @click.option("--output", type=click.Path(path_type=pathlib.Path, file_okay=False), required=True, help="Output directory.")
 @click.option("--prefix", default="vhamster", show_default=True, help="Base filename prefix for outputs.")
 @click.option("--force", "force", is_flag=True, help="Overwrite output if it exists.")
-@click.option("--ensemble-dir", type=click.Path(path_type=pathlib.Path), default=_DEFAULT_MODEL_ROOT / "best_params_20260331", show_default=True, help="Root directory containing fold_* subdirs.")
+@click.option("--ensemble-dir", type=click.Path(path_type=pathlib.Path), default=_DEFAULT_MODEL_ROOT, show_default=True, help="Root directory containing fold_* subdirs.")
 @click.option("--fold-dirs", type=click.Path(path_type=pathlib.Path), multiple=True, help="Explicit fold directories (overrides --ensemble-dir).")
+@click.option("--genomad-db", type=click.Path(path_type=pathlib.Path), default=None, help="geNomad MMseqs2 DB path.")
 @click.option("--num-folds", type=int, default=5, show_default=True, help="Number of folds to use.")
 @click.option("--fold-index", type=int, default=None, help="Use only one fold by index, e.g. 0..4.")
-@click.option("--checkpoint-subdir", default="best_macro_f1_model", show_default=True, help="Checkpoint subdirectory name.")
-@click.option("--length-class-temperatures", type=str, default=str(_DEFAULT_MODEL_ROOT / "length_class_temperatures_continuous_brier.json"), show_default=True, help="Path to per-(class, length) temperature JSON produced by calibrate_length_aware.py.")
+@click.option("--checkpoint-subdir", default="best_macro_auprc_model", show_default=True, help="Checkpoint subdirectory name.")
+@click.option("--calibration-params", type=str, default=str(_DEFAULT_MODEL_ROOT / "length_aware_vector_scaling_anchors_5.json"), show_default=True, help="Path to length-aware vector scaling JSON.")
 @click.option("--chunk-size", type=int, default=10000, show_default=True, help="Chunk length in bp.")
 @click.option("--overlap", type=int, default=1000, show_default=True, help="Overlap between chunks in bp.")
 @click.option("--batch-size", type=int, default=16, show_default=True, help="Inference batch size.")
 @click.option("--fp16", is_flag=True, help="Use FP16 mixed precision.")
 @click.option("--num-workers", type=int, default=4, show_default=True, help="DataLoader workers.")
 @click.option("--aggregate-chunks/--no-aggregate-chunks", default=True, show_default=True, help="Enable/disable genome-level consensus output.")
-@click.option("--genome-output", type=click.Path(path_type=pathlib.Path), default=None, help="Path for genome-level TSV output.")
+@click.option("--verbose", is_flag=True, help="Write per-fold predictions and GLM gate weights to {prefix}.verbose.tsv.")
 def main(
     fasta: pathlib.Path,
     output: pathlib.Path,
@@ -822,21 +576,32 @@ def main(
     force: bool,
     ensemble_dir: pathlib.Path,
     fold_dirs: Tuple[pathlib.Path, ...],
+    genomad_db: pathlib.Path,
     num_folds: int,
     fold_index: Optional[int],
     checkpoint_subdir: str,
-    length_class_temperatures: str,
+    calibration_params: str,
     chunk_size: int,
     overlap: int,
     batch_size: int,
     fp16: bool,
     num_workers: int,
     aggregate_chunks: bool,
-    genome_output: Optional[pathlib.Path],
+    verbose: bool,
 ) -> None:
     output_dir = output
     output_dir.mkdir(parents=True, exist_ok=True)
     log_path = _configure_logging(output_dir, prefix)
+
+    # Go looking for genomad database 
+    if genomad_db is None:
+        genomad_db = ensemble_dir / "genomad_db"
+        
+    if not (genomad_db / "genomad_marker_metadata.tsv").exists():
+        raise click.ClickException(
+            f"geNomad database not found at {genomad_db}. "
+            "Please run 'install_models.py' to download it, or provide an explicit path using --genomad-db."
+        )
 
     args = SimpleNamespace(
         fasta=fasta,
@@ -846,21 +611,20 @@ def main(
         force=force,
         ensemble_dir=ensemble_dir,
         fold_dirs=list(fold_dirs) if fold_dirs else None,
+        genomad_db=genomad_db,
         num_folds=num_folds,
         fold_index=fold_index,
         checkpoint_subdir=checkpoint_subdir,
-        length_class_temperatures=length_class_temperatures,
+        calibration_params=calibration_params,
         chunk_size=chunk_size,
         overlap=overlap,
         batch_size=batch_size,
         fp16=fp16,
         num_workers=num_workers,
         aggregate_chunks=aggregate_chunks,
-        genome_output=genome_output,
+        genome_output=output_dir / f"{prefix}.genomes.tsv",
+        verbose=verbose,
     )
-
-    if args.aggregate_chunks and args.genome_output is None:
-        args.genome_output = args.output_dir / f"{args.prefix}.genomes.tsv"
 
     args.fold_dirs_resolved = _discover_fold_dirs(args)
     if args.fold_index is not None:
@@ -884,6 +648,13 @@ def main(
 
     logger.info(f"Logging to: {log_path}")
     _run(args)
+
+    # Ensure calibration_params points to ensemble_dir if default site-packages path doesn't exist
+    calib_path = pathlib.Path(calibration_params)
+    if not calib_path.exists():
+        alt_calib = ensemble_dir / "length_aware_vector_scaling_anchors_5.json"
+        if alt_calib.exists():
+            calibration_params = str(alt_calib)
 
 
 if __name__ == "__main__":

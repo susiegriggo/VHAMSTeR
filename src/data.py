@@ -1,16 +1,16 @@
-#!/usr/bin/env python3 
+#!/usr/bin/env python3
 """
-modules to handle data 
+modules to handle data
 """
 
-# imports 
+# imports
 import pathlib
 import pandas as pd
 import multiprocessing
 import concurrent.futures
 from Bio import SeqIO
 from sklearn.model_selection import train_test_split
-from typing import Tuple, List, Dict
+from typing import Tuple, List, Dict, Optional
 import torch
 from tqdm.auto import tqdm
 from loguru import logger
@@ -18,6 +18,7 @@ import numpy as np
 import random
 import sequences
 from torch.utils.data import Sampler
+from features import ARCH_FEATURE_NAMES_NO_FRAGMENT
 
 
 class EpochRedrawProkaryoteSampler(Sampler):
@@ -62,15 +63,39 @@ class EpochRedrawProkaryoteSampler(Sampler):
         unique, counts = np.unique(labels_sampled, return_counts=True)
         return dict(zip(unique, counts))
 
-def load_epoch_fold_data(epoch_dir, use_features=True):
+def load_epoch_fold_data(epoch_dir, use_features=True, xgb_features_filename="xgb_probabilities.tsv"):
     """
-    Loads FASTA, labels, and features from a given epoch/fold directory.
-    Returns: seqs, labels, accs, idx_to_label, feature_names, features
+    Loads FASTA, labels, precomputed XGBoost probabilities, and raw arch/marker
+    features from a given epoch/fold directory.
+
+    The raw features (structural/architectural + marker frequencies) come from the
+    ``*features.tsv`` file that is NOT ``xgb_probabilities.tsv``.  They are used as
+    gate inputs in the ``GenomeClassifier`` to decouple gating from the model's own
+    XGBoost predictions and prevent training-set data leakage.
+
+    Returns:
+        seqs, labels, accs, idx_to_label, feature_names, features,
+        raw_feature_names, raw_features
+        (raw_feature_names and raw_features are None when no raw file is found)
     """
     epoch_dir = pathlib.Path(epoch_dir)
     fasta_file = next(epoch_dir.glob("*.fasta"))
     labels_file = next(epoch_dir.glob("*labels.tsv"))
-    features_file = next(epoch_dir.glob("*features.tsv"), None)
+    features_file = epoch_dir / xgb_features_filename
+    if use_features and not features_file.exists():
+        raise FileNotFoundError(
+            f"Expected precomputed {xgb_features_filename} in {epoch_dir} because use_features=True. "
+            "Run hierarchical XGBoost stacking first or disable feature usage explicitly."
+        )
+    if not features_file.exists():
+        features_file = None
+
+    # Locate raw arch/marker features file (any *features.tsv that isn't the XGB probs file)
+    _raw_feature_candidates = sorted(
+        p for p in epoch_dir.glob("*features.tsv")
+        if p.name != xgb_features_filename and p.name != "xgb_probabilities.tsv"
+    )
+    raw_features_file = _raw_feature_candidates[0] if _raw_feature_candidates else None
 
     seqs, accs = sequences.load_fasta_sequences(fasta_file)
     label_map = {}
@@ -90,18 +115,55 @@ def load_epoch_fold_data(epoch_dir, use_features=True):
 
     feature_names, features = None, None
     if use_features and features_file is not None:
+        df = pd.read_csv(features_file, sep='\t')
+        id_col = None
+        for candidate in ("accession", "chunk_id", "id"):
+            if candidate in df.columns:
+                id_col = candidate
+                break
+        if id_col is None:
+            id_col = df.columns[0]
+
+        feature_names = [c for c in df.columns if c != id_col]
+        if not feature_names:
+            raise ValueError(
+                f"Precomputed feature file has no usable feature columns: {features_file}"
+            )
+
+        feature_df = df.set_index(id_col)[feature_names]
+        feature_df.index = feature_df.index.astype(str)
+        feature_df = feature_df.apply(pd.to_numeric, errors="coerce").fillna(0.0)
+        aligned = feature_df.reindex(accs).fillna(0.0)
+        features = aligned.to_numpy(dtype=np.float32)
+
+    # Load raw biological features for gate input (optional — not required to exist)
+    raw_feature_names, raw_features = None, None
+    if raw_features_file is not None:
         try:
-            # Polars is faster but requires dependency, fallback to pandas if needed or assume installed
-            import polars as pl
-            df = pl.read_csv(features_file, separator='\t')
-            feature_names = [c for c in df.columns if c != 'chunk_id']
-            features = df[feature_names].to_numpy()
-        except ImportError:
-            df = pd.read_csv(features_file, sep='\t')
-            feature_names = [c for c in df.columns if c != 'chunk_id']
-            features = df[feature_names].to_numpy()
-            
-    return seqs, labels, accs, idx_to_label, feature_names, features
+            raw_df = pd.read_csv(raw_features_file, sep='\t')
+            raw_id_col = None
+            for candidate in ("accession", "chunk_id", "id"):
+                if candidate in raw_df.columns:
+                    raw_id_col = candidate
+                    break
+            if raw_id_col is None:
+                raw_id_col = raw_df.columns[0]
+
+            # Strictly use the 12 canonical arch features — in canonical order — as gate input.
+            # This guarantees training and inference receive the identical feature vector.
+            raw_feature_names = [c for c in ARCH_FEATURE_NAMES_NO_FRAGMENT if c in raw_df.columns]
+            if raw_feature_names:
+                raw_feat_df = raw_df.set_index(raw_id_col)[raw_feature_names]
+                raw_feat_df.index = raw_feat_df.index.astype(str)
+                raw_feat_df = raw_feat_df.apply(pd.to_numeric, errors="coerce").fillna(0.0)
+                raw_aligned = raw_feat_df.reindex(accs).fillna(0.0)
+                raw_features = raw_aligned.to_numpy(dtype=np.float32)
+            else:
+                raw_feature_names = None
+        except Exception:
+            raw_feature_names, raw_features = None, None
+
+    return seqs, labels, accs, idx_to_label, feature_names, features, raw_feature_names, raw_features
 
 def load_labels(labels_file: pathlib.Path) -> Tuple[Dict[str, str], List[str]]:
     """Load labels from TSV/CSV file."""
@@ -128,9 +190,11 @@ def load_data(
     labels_file: pathlib.Path,
     test_size: float = 0.2,
     random_seed: int = 42,
+    use_rv: bool = False,
     use_features: bool = True,
     use_class_weights: bool = False,
     features_file: pathlib.Path = None,
+    output_dir: Optional[pathlib.Path] = None,
 ) -> Tuple[List[str], List[int], List[str], List[str], List[int], List[str], Dict[int, str], List[str], List[List[float]], List[List[float]], torch.Tensor]:
     """Load sequences and labels, split into train/val sets."""
     label_dict, label_names = load_labels(labels_file)
@@ -192,16 +256,16 @@ def load_data(
             # but usually called via fine_tune_glm context.
             # Assuming 'from features import extract_features_worker' logic in calling script or similar
             # Since data.py imports 'sequences', make sure 'extract_features_worker' is available or import from features.py
-            from features import extract_features_worker 
+            from features import extract_features_worker, ARCH_FEATURE_NAMES_NO_FRAGMENT
             
-            feature_names = ['seq_len_kb', 'fragment_size', 'strand_switch_rate', 'coding_density', 'leaderless_freq', 'short_utr_freq', 'no_rbs_freq', 'sd_bacteroidetes_rbs_freq', 'sd_canonical_rbs_freq', 'tatata_rbs_freq', 'mean_rbs_score', 'gene_density', 'gene_density_fwd', 'gene_density_rev']
+            feature_names = ARCH_FEATURE_NAMES_NO_FRAGMENT
             logger.info(f"Extracting {len(feature_names)} features from {len(sequences)} sequences...")
             
             num_workers = min(multiprocessing.cpu_count(), len(sequences))
             logger.info(f"Using {num_workers} workers for parallel feature extraction...")
             
             with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
-                args_list = [(seq, acc, feature_names, 10000) for seq, acc in zip(sequences, accessions)]
+                args_list = [(seq, acc, use_rv, feature_names, 10000) for seq, acc in zip(sequences, accessions)]
                 features_list = list(tqdm(
                     executor.map(extract_features_worker, args_list), 
                     desc="Extracting features", 
@@ -225,5 +289,5 @@ def load_data(
         val_features = None
     
     logger.info(f"Split: {len(train_seqs)} train, {len(val_seqs)} validation")
-    
+
     return train_seqs, train_labels, train_accs, val_seqs, val_labels, val_accs, idx_to_label, feature_names, train_features, val_features, weights
