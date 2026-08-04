@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-VHAMSTeR v1.2.0
+VHAMSTeR
 ==============================================================
 Virus Host Assignment Model using Sequence Transformers and Reading-frames.
 Runs 5-fold deep ensemble inference with per-fold XGBoost stacking 
 and applies length-aware continuous vector calibration.
 """
-
-__version__ = "1.2.0"
 
 import gc
 import json
@@ -35,6 +33,8 @@ from torch import nn
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import AutoModel, AutoModelForMaskedLM, AutoTokenizer
+
+__version__ = (pathlib.Path(__file__).resolve().parent / "VERSION").read_text().strip()
 
 # ── src/ on path ──────────────────────────────────────────────────────────────
 _ROOT = pathlib.Path(__file__).resolve().parent
