@@ -293,13 +293,15 @@ def _run(args: Any) -> None:
                 "Ensure you are passing the root directory of a complete geNomad database."
             )
 
-        logger.info("      Running MMseqs2 against geNomad marker database...")
+        mmseqs_threads = getattr(args, 'mmseqs_threads', 4)
+        logger.info(f"      Running MMseqs2 against geNomad marker database ({mmseqs_threads} threads)...")
         seq_dict = dict(zip(chunked_accs, chunked_seqs))
 
         marker_hits, _, annotation_rows = extract_genomad_markers(
             sequences=seq_dict,
             genomad_db=args.genomad_db,
             genomad_metadata=genomad_metadata,
+            threads=mmseqs_threads,
             return_details=True,
         )
         genomad_marker_dict = marker_hits
@@ -596,6 +598,7 @@ def _run(args: Any) -> None:
 @click.option("--chunk-size", type=int, default=10000, show_default=True, help="Chunk length in bp (must match value used with vhamster).")
 @click.option("--overlap", type=int, default=1000, show_default=True, help="Overlap between chunks in bp (must match value used with vhamster).")
 @click.option("--num-workers", type=int, default=4, show_default=True, help="Worker processes for PyRodigal feature extraction.")
+@click.option("--mmseqs-threads", type=int, default=None, help="Threads for protein prediction and MMseqs2 search. Defaults to --num-workers when not set, so on a cluster you can just set --num-workers to your CPU count and both steps scale together.")
 def features_main(
     fasta: pathlib.Path,
     output: pathlib.Path,
@@ -605,6 +608,7 @@ def features_main(
     chunk_size: int,
     overlap: int,
     num_workers: int,
+    mmseqs_threads: Optional[int],
 ) -> None:
     """Extract architectural and geNomad marker features without running the GLM.
 
@@ -665,12 +669,14 @@ def features_main(
         raise click.ClickException(
             f"geNomad metadata file not found: {genomad_metadata}"
         )
-    logger.info("Running MMseqs2 against geNomad marker database")
+    effective_mmseqs_threads = mmseqs_threads if mmseqs_threads is not None else num_workers
+    logger.info(f"Running MMseqs2 against geNomad marker database ({effective_mmseqs_threads} threads)")
     seq_dict = dict(zip(chunked_accs, chunked_seqs))
     marker_hits, _, annotation_rows = extract_genomad_markers(
         sequences=seq_dict,
         genomad_db=genomad_db,
         genomad_metadata=genomad_metadata,
+        threads=effective_mmseqs_threads,
         return_details=True,
     )
     hits_json = output_dir / f"{prefix}.genomad_hits.json"
@@ -757,6 +763,7 @@ def _preflight_checks(args: Any) -> None:
 @click.option("--batch-size", type=int, default=16, show_default=True, help="Inference batch size.")
 @click.option("--fp16", is_flag=True, help="Use FP16 mixed precision.")
 @click.option("--num-workers", type=int, default=4, show_default=True, help="DataLoader workers.")
+@click.option("--mmseqs-threads", type=int, default=4, show_default=True, help="Threads for protein prediction and MMseqs2 search (only used when --precomputed-features is not set).")
 @click.option("--precomputed-features", type=click.Path(path_type=pathlib.Path), default=None, help="Directory containing {prefix}.arch_features.tsv and {prefix}.genomad_hits.json from vhamster-features. Skips MMseqs2 and PyRodigal.")
 @click.option("--aggregate-chunks/--no-aggregate-chunks", default=True, show_default=True, help="Enable/disable genome-level consensus output.")
 @click.option("--verbose", is_flag=True, help="Write per-fold predictions and GLM gate weights to {prefix}.verbose.tsv.")
@@ -777,6 +784,7 @@ def main(
     batch_size: int,
     fp16: bool,
     num_workers: int,
+    mmseqs_threads: int,
     precomputed_features: Optional[pathlib.Path],
     aggregate_chunks: bool,
     verbose: bool,
@@ -813,6 +821,7 @@ def main(
         batch_size=batch_size,
         fp16=fp16,
         num_workers=num_workers,
+        mmseqs_threads=mmseqs_threads,
         precomputed_features=precomputed_features,
         aggregate_chunks=aggregate_chunks,
         genome_output=output_dir / f"{prefix}.genomes.tsv",
