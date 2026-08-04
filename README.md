@@ -32,13 +32,15 @@ It runs a 5-fold ensemble and writes:
 - `xgboost`
 - `joblib`
 
-### External tools (must be installed separately)
+### External tools
 
-- `mmseqs2` — used for geNomad marker search. Install via conda:
+- `mmseqs2` — used for geNomad marker search. If you use the conda environment (see below), it is included automatically. Otherwise install it via conda/mamba:
 
 ```bash
 conda install -c bioconda mmseqs2
 ```
+
+Alternatively, precompiled static binaries are available from the [MMseqs2 GitHub releases](https://github.com/soedinglab/MMseqs2/releases).
 
 ### geNomad database
 
@@ -59,7 +61,7 @@ pip install -e .
 This installs all Python dependencies listed in `pyproject.toml` and registers the
 `vhamster` and `vhamster-install-models` shell commands.
 
-> **Note:** `mmseqs2` is not a Python package and must be installed via conda (see above).
+> **Note:** `mmseqs2` is not a Python package and must be installed separately (see above).
 
 ### Optional GPU support
 
@@ -145,26 +147,24 @@ terminal.
 ## Quick-start example
 
 A test genome (accession NC_110914.1) is included in `test_data/`. After
-installing `vhamster`, the model bundle, and a geNomad database, run from the
+installing `vhamster` and running `vhamster-install-models`, run from the
 repository root:
 
 ```bash
 vhamster \
   --fasta test_data/escherichia_phage.fasta \
   --output results/test_run \
-  --prefix escherichia_phage \
-  --genomad-db /path/to/genomad_db
+  --prefix escherichia_phage
 ```
 
-If your model files are stored elsewhere:
+If your model files are stored in a non-default location:
 
 ```bash
 vhamster \
   --fasta test_data/escherichia_phage.fasta \
   --output results/test_run \
   --prefix escherichia_phage \
-  --ensemble-dir /path/to/vhamster_models_v1.2.0 \
-  --genomad-db /path/to/genomad_db
+  --ensemble-dir /path/to/vhamster_models_v1.2.0
 ```
 
 This writes two files:
@@ -186,8 +186,7 @@ Minimal example (models at their default installed location):
 ```bash
 vhamster \
   --fasta /path/to/input.fasta \
-  --output /path/to/results_dir \
-  --genomad-db /path/to/genomad_db
+  --output /path/to/results_dir
 ```
 
 Add a custom output prefix:
@@ -196,7 +195,6 @@ Add a custom output prefix:
 vhamster \
   --fasta /path/to/input.fasta \
   --output /path/to/results_dir \
-  --genomad-db /path/to/genomad_db \
   --prefix sampleA
 ```
 
@@ -206,7 +204,6 @@ Use a custom ensemble directory:
 vhamster \
   --fasta /path/to/input.fasta \
   --output /path/to/results_dir \
-  --genomad-db /path/to/genomad_db \
   --ensemble-dir /path/to/vhamster_models_v1.2.0
 ```
 
@@ -216,7 +213,6 @@ Benchmark using a single fold (for example, only `fold_3`):
 vhamster \
   --fasta /path/to/input.fasta \
   --output /path/to/results_dir \
-  --genomad-db /path/to/genomad_db \
   --ensemble-dir /path/to/vhamster_models_v1.2.0 \
   --fold-index 3
 ```
@@ -227,9 +223,38 @@ Use a non-default calibration parameters file:
 vhamster \
   --fasta /path/to/input.fasta \
   --output /path/to/results_dir \
-  --genomad-db /path/to/genomad_db \
   --calibration-params /path/to/length_aware_vector_scaling_anchors_toplabel_5.json
 ```
+
+## Two-stage pipeline (HPC)
+
+For large datasets, the CPU-intensive feature extraction (PyRodigal + MMseqs2) and the GPU-intensive GLM inference can be run as two separate jobs. This lets you pipeline batches: one batch's features are computed on a CPU node while the previous batch's GLM inference runs on a GPU node.
+
+**Stage 1 — feature extraction (CPU node, no GPU needed):**
+
+```bash
+vhamster-features \
+  --fasta batch_001.fasta \
+  --output features/batch_001 \
+  --prefix batch_001
+```
+
+This writes:
+- `features/batch_001/batch_001.arch_features.tsv` — per-chunk architectural features
+- `features/batch_001/batch_001.genomad_hits.json` — geNomad marker hits
+- `features/batch_001/batch_001.gene_predictions.tsv` — per-gene annotations
+
+**Stage 2 — GLM inference (GPU node):**
+
+```bash
+vhamster \
+  --fasta batch_001.fasta \
+  --output results/batch_001 \
+  --prefix batch_001 \
+  --precomputed-features features/batch_001
+```
+
+The `--chunk-size` and `--overlap` values must match between the two stages (defaults are the same, so no flags needed if you use defaults for both).
 
 ## Outputs
 

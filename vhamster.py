@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-VHAMSTeR v1.2.0
+VHAMSTeR
 ==============================================================
 Virus Host Assignment Model using Sequence Transformers and Reading-frames.
 Runs 5-fold deep ensemble inference with per-fold XGBoost stacking 
 and applies length-aware continuous vector calibration.
 """
-
-__version__ = "1.2.0"
 
 import gc
 import json
@@ -15,6 +13,7 @@ import multiprocessing
 import pathlib
 import pickle
 import re
+import shutil
 import sys
 import sysconfig
 from concurrent.futures import ProcessPoolExecutor
@@ -34,6 +33,8 @@ from torch import nn
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import AutoModel, AutoModelForMaskedLM, AutoTokenizer
+
+__version__ = (pathlib.Path(__file__).resolve().parent / "VERSION").read_text().strip()
 
 # ── src/ on path ──────────────────────────────────────────────────────────────
 _ROOT = pathlib.Path(__file__).resolve().parent
@@ -113,6 +114,36 @@ def _load_calibration_params(path: Optional[Union[str, pathlib.Path]]) -> Option
         data = json.load(f)
     logger.info(f"Loaded length-aware vector scaling parameters from {p}")
     return data
+
+
+def _apply_calibration(logits: torch.Tensor, calib_params: Optional[Dict], chunk_lengths: List[int], num_classes: int) -> np.ndarray:
+    """Apply length-aware vector scaling calibration to a set of logits."""
+    if calib_params and "classes" in calib_params:
+        length_scale = float(calib_params.get("length_scale", 1000.0))
+        w0 = torch.tensor([calib_params["classes"].get(str(c), {"w0": 0.0})["w0"] for c in range(num_classes)], dtype=torch.float32)
+        w1 = torch.tensor([calib_params["classes"].get(str(c), {"w1": 0.0})["w1"] for c in range(num_classes)], dtype=torch.float32)
+        lengths_tensor = torch.tensor(chunk_lengths, dtype=torch.float32).clamp(min=1e-6)
+        log_norm_lengths = torch.log(lengths_tensor / length_scale)
+        temps = torch.exp(w0.unsqueeze(0) + w1.unsqueeze(0) * log_norm_lengths.unsqueeze(1))
+
+        raw_probs = torch.softmax(logits, dim=-1)
+        pred_cls = torch.argmax(logits, dim=-1)
+        n = logits.shape[0]
+        idx = torch.arange(n)
+        top_temp = temps[idx, pred_cls]
+        top_raw = raw_probs[idx, pred_cls]
+        top_raw_clamp = top_raw.clamp(min=1e-7, max=1.0 - 1e-7)
+        bce_logit = torch.log(top_raw_clamp / (1.0 - top_raw_clamp))
+        cal_top = torch.sigmoid(bce_logit / top_temp)
+        remaining_raw = (1.0 - top_raw).clamp(min=1e-8)
+        remaining_cal = (1.0 - cal_top).clamp(min=0.0)
+        scale = (remaining_cal / remaining_raw).unsqueeze(1)
+        final_probs = raw_probs * scale
+        final_probs[idx, pred_cls] = cal_top
+        final_probs = final_probs / final_probs.sum(dim=-1, keepdim=True)
+        return np.round(final_probs.numpy(), 4)
+    else:
+        return np.round(torch.softmax(logits, dim=-1).numpy(), 4)
 
 
 def _reconstruct_hierarchical_probs(xgb1_probs, xgb2_probs, n_fine_classes, prokaryote_idx, euk_fine_indices):
@@ -219,43 +250,65 @@ def _run(args: Any) -> None:
     logger.info(f"{len(accessions)} sequence(s) -> {len(chunked_seqs)} chunk(s)")
 
     # ── [3/5] Global Feature Extraction (PyRodigal & geNomad MMseqs2) ────────
-    logger.info("[3/5] Extracting global architectural features & geNomad hits")
-    
-    # 3a. PyRodigal
-    arch_feature_names = list(ARCH_FEATURE_NAMES) + ["n_genes"]
-    n_workers = min(multiprocessing.cpu_count(), len(chunked_seqs), 8)
-    args_list = [(s, a, False, arch_feature_names, args.chunk_size) for s, a in zip(chunked_seqs, chunked_accs)]
-    with ProcessPoolExecutor(max_workers=n_workers) as ex:
-        raw_arch_features = list(tqdm(ex.map(extract_features_worker, args_list), total=len(chunked_seqs), desc="      PyRodigal"))
+    if args.precomputed_features:
+        logger.info("[3/5] Loading precomputed architectural features & geNomad hits")
+        feat_dir = pathlib.Path(args.precomputed_features)
+        arch_tsv = feat_dir / f"{args.prefix}.arch_features.tsv"
+        hits_json = feat_dir / f"{args.prefix}.genomad_hits.json"
+        feat_df = pl.read_csv(arch_tsv, separator="\t")
+        precomp_accs = feat_df["accession"].to_list()
+        features_df_arch = feat_df.drop("accession")
+        arch_feature_names = features_df_arch.columns
+        with open(hits_json) as _fh:
+            genomad_marker_dict = json.load(_fh)
+        annotation_rows = []
+        # still need chunked_seqs for GLM tokenization — re-chunk from FASTA
+        seqs, accessions = load_fasta_sequences(str(args.fasta))
+        chunked_seqs, chunked_accs = _chunk_sequences(seqs, accessions, args.chunk_size, args.overlap)
+        if chunked_accs != precomp_accs:
+            raise click.ClickException(
+                "Chunk accessions in precomputed features do not match the current FASTA + "
+                "--chunk-size/--overlap. Ensure these parameters match the values used with "
+                "vhamster-features."
+            )
+        logger.info(f"      Loaded {len(chunked_accs)} chunk(s) from precomputed features")
+    else:
+        logger.info("[3/5] Extracting global architectural features & geNomad hits")
 
-    raw_arch_array = np.array(raw_arch_features, dtype=np.float32)
-    features_df_arch = pl.DataFrame(raw_arch_array, schema=arch_feature_names)
-    arch_cols_no_frag = [c for c in ARCH_FEATURE_NAMES if c != "fragment_size"]
+        # 3a. PyRodigal
+        arch_feature_names = list(ARCH_FEATURE_NAMES) + ["n_genes"]
+        n_workers = min(multiprocessing.cpu_count(), len(chunked_seqs), 8)
+        args_list = [(s, a, arch_feature_names, args.chunk_size) for s, a in zip(chunked_seqs, chunked_accs)]
+        with ProcessPoolExecutor(max_workers=n_workers) as ex:
+            raw_arch_features = list(tqdm(ex.map(extract_features_worker, args_list), total=len(chunked_seqs), desc="      PyRodigal"))
 
-    # 3b. geNomad MMseqs2
-    genomad_metadata = args.genomad_db / "genomad_marker_metadata.tsv"
-    if not genomad_metadata.exists():
-        raise FileNotFoundError(
-            f"geNomad metadata file not found at expected location: {genomad_metadata}\n"
-            "Ensure you are passing the root directory of a complete geNomad database."
+        raw_arch_array = np.array(raw_arch_features, dtype=np.float32)
+        features_df_arch = pl.DataFrame(raw_arch_array, schema=arch_feature_names)
+
+        # 3b. geNomad MMseqs2
+        genomad_metadata = args.genomad_db / "genomad_marker_metadata.tsv"
+        if not genomad_metadata.exists():
+            raise FileNotFoundError(
+                f"geNomad metadata file not found at expected location: {genomad_metadata}\n"
+                "Ensure you are passing the root directory of a complete geNomad database."
+            )
+
+        logger.info("      Running MMseqs2 against geNomad marker database...")
+        seq_dict = dict(zip(chunked_accs, chunked_seqs))
+
+        marker_hits, _, annotation_rows = extract_genomad_markers(
+            sequences=seq_dict,
+            genomad_db=args.genomad_db,
+            genomad_metadata=genomad_metadata,
+            return_details=True,
         )
+        genomad_marker_dict = marker_hits
 
-    logger.info("      Running MMseqs2 against geNomad marker database...")
-    seq_dict = dict(zip(chunked_accs, chunked_seqs))
+        gene_table_path = args.output_dir / f"{args.prefix}.gene_predictions.tsv"
+        write_annotation_rows(annotation_rows, gene_table_path)
+        logger.info(f"      Gene prediction table written to: {gene_table_path}")
 
-    # Update the function call to request details 
-    marker_hits, _, annotation_rows = extract_genomad_markers(
-        sequences=seq_dict,
-        genomad_db=args.genomad_db,
-        genomad_metadata=genomad_metadata,
-        return_details=True  # Request detailed output for verbose logging
-    )
-    genomad_marker_dict = marker_hits 
-
-    # write a gene prediction table 
-    gene_table_path = args.output_dir / f"{args.prefix}.gene_predictions.tsv"
-    write_annotation_rows(annotation_rows, gene_table_path)
-    logger.info(f"      Gene prediction table written to: {gene_table_path}")
+    arch_cols_no_frag = [c for c in arch_feature_names if c != "fragment_size" and c != "n_genes"]
     
     # ── [4/5] Ensemble Inference Loop ────────────────────────────────────────
     logger.info("[4/5] Running ensemble inference across folds")
@@ -419,17 +472,16 @@ def _run(args: Any) -> None:
                     fold_alphas_list.append(alpha)
 
         fold_logits = torch.cat(fold_logits_list, dim=0)
-        fold_probs = np.round(F.softmax(fold_logits, dim=-1).numpy(), 4)
         fold_alphas = np.round(
             np.concatenate(fold_alphas_list) if fold_alphas_list else np.full(len(chunked_seqs), np.nan),
             4,
         )
-        per_fold_basic.append({"fold_name": fold_dir.name, "probs": fold_probs, "alphas": fold_alphas})
+        per_fold_basic.append({"fold_name": fold_dir.name, "logits": fold_logits, "alphas": fold_alphas})
 
         if args.verbose:
             per_fold_verbose.append({
                 "fold_name": fold_dir.name,
-                "probs": fold_probs,
+                "logits": fold_logits,
                 "alphas": fold_alphas,
                 "features": fold_features_dicts
             })
@@ -448,51 +500,12 @@ def _run(args: Any) -> None:
     avg_logits = accumulated_logits / len(args.fold_dirs_resolved)
     chunk_lengths = [len(s) for s in chunked_seqs]
 
-    if calib_params and "classes" in calib_params:
-        length_scale = float(calib_params.get("length_scale", 1000.0))
-        w0_list = [calib_params["classes"].get(str(c), {"w0": 0.0})["w0"] for c in range(num_classes)]
-        w1_list = [calib_params["classes"].get(str(c), {"w1": 0.0})["w1"] for c in range(num_classes)]
-        
-        w0 = torch.tensor(w0_list, dtype=torch.float32)
-        w1 = torch.tensor(w1_list, dtype=torch.float32)
-        lengths_tensor = torch.tensor(chunk_lengths, dtype=torch.float32).clamp(min=1e-6)
-        log_norm_lengths = torch.log(lengths_tensor / length_scale)
-        
-        # T_c(L) = exp(w0_c + w1_c * log(L/S))
-        temps = torch.exp(w0.unsqueeze(0) + w1.unsqueeze(0) * log_norm_lengths.unsqueeze(1))
-        
-        # --- Top-Label Proportional Redistribution (Log-Odds) ---
-        raw_probs = torch.softmax(avg_logits, dim=-1)
-        pred_cls = torch.argmax(avg_logits, dim=-1)
-        n = avg_logits.shape[0]
-        idx = torch.arange(n)
-        
-        # Get the temperature specifically for the predicted class
-        top_temp = temps[idx, pred_cls]
-        
-        # Convert raw top probability to log-odds for BCE calibration
-        top_raw = raw_probs[idx, pred_cls]
-        top_raw_clamp = top_raw.clamp(min=1e-7, max=1.0 - 1e-7)
-        bce_logit = torch.log(top_raw_clamp / (1.0 - top_raw_clamp))
-        
-        # Calibrate the log-odds via temperature and sigmoid
-        cal_top = torch.sigmoid(bce_logit / top_temp)
-        
-        # Proportional redistribution for runner-up classes
-        remaining_raw = (1.0 - top_raw).clamp(min=1e-8)
-        remaining_cal = (1.0 - cal_top).clamp(min=0.0)
-        scale = (remaining_cal / remaining_raw).unsqueeze(1)
-        
-        final_probs = raw_probs * scale
-        final_probs[idx, pred_cls] = cal_top
-        
-        # Re-normalise to correct any floating-point drift
-        final_probs = final_probs / final_probs.sum(dim=-1, keepdim=True)
-        calibrated_probs = np.round(final_probs.numpy(), 4)
-        
-    else:
-        # Fallback if no calibration file is found
-        calibrated_probs = np.round(torch.softmax(avg_logits, dim=-1).numpy(), 4)
+    calibrated_probs = _apply_calibration(avg_logits, calib_params, chunk_lengths, num_classes)
+    for fold_data in per_fold_basic:
+        fold_data["probs"] = _apply_calibration(fold_data["logits"], calib_params, chunk_lengths, num_classes)
+    if args.verbose:
+        for fold_data in per_fold_verbose:
+            fold_data["probs"] = _apply_calibration(fold_data["logits"], calib_params, chunk_lengths, num_classes)
 
 
     class_cols = [label_mapping.get(i, f"class_{i}") for i in range(num_classes)]
@@ -576,6 +589,159 @@ def _run(args: Any) -> None:
 
 @click.command(context_settings={"help_option_names": ["-h", "--help"]})
 @click.option("--fasta", type=click.Path(path_type=pathlib.Path, exists=True, dir_okay=False), required=True, help="Input FASTA file.")
+@click.option("--output", type=click.Path(path_type=pathlib.Path, file_okay=False), required=True, help="Output directory for feature files.")
+@click.option("--prefix", default="vhamster", show_default=True, help="Base filename prefix for output files.")
+@click.option("--genomad-db", type=click.Path(path_type=pathlib.Path), default=None, help="geNomad MMseqs2 DB path.")
+@click.option("--ensemble-dir", type=click.Path(path_type=pathlib.Path), default=_DEFAULT_MODEL_ROOT, show_default=True, help="Root directory containing fold_* subdirs (used to locate geNomad DB if --genomad-db not set).")
+@click.option("--chunk-size", type=int, default=10000, show_default=True, help="Chunk length in bp (must match value used with vhamster).")
+@click.option("--overlap", type=int, default=1000, show_default=True, help="Overlap between chunks in bp (must match value used with vhamster).")
+@click.option("--num-workers", type=int, default=4, show_default=True, help="Worker processes for PyRodigal feature extraction.")
+def features_main(
+    fasta: pathlib.Path,
+    output: pathlib.Path,
+    prefix: str,
+    genomad_db: Optional[pathlib.Path],
+    ensemble_dir: pathlib.Path,
+    chunk_size: int,
+    overlap: int,
+    num_workers: int,
+) -> None:
+    """Extract architectural and geNomad marker features without running the GLM.
+
+    Produces {prefix}.arch_features.tsv and {prefix}.genomad_hits.json in the
+    output directory. Pass the output directory to 'vhamster --precomputed-features'
+    to skip this step on the GPU node.
+    """
+    output_dir = output
+    log_path = _configure_logging(output_dir, prefix)
+    logger.info(f"VHAMSTeR v{__version__} — feature extraction only")
+    logger.info(f"Logging to: {log_path}")
+
+    if genomad_db is None:
+        genomad_db = ensemble_dir / "genomad_db"
+
+    # Pre-flight: mmseqs2 + genomad_db (no model files needed here)
+    errors: List[str] = []
+    if shutil.which("mmseqs") is None:
+        errors.append(
+            "mmseqs2 binary not found in PATH. Install via conda:\n"
+            "    conda install -c bioconda mmseqs2"
+        )
+    mmseqs_db_type = genomad_db / "genomad_db.dbtype"
+    if not mmseqs_db_type.exists():
+        errors.append(
+            f"geNomad MMseqs2 database not found at {genomad_db / 'genomad_db'}. "
+            "Run 'vhamster-install-models' to download it, or provide --genomad-db."
+        )
+    if errors:
+        raise click.ClickException("Pre-flight validation failed:\n  " + "\n  ".join(errors))
+
+    # Chunk sequences
+    logger.info("Loading and chunking sequences")
+    seqs, accessions = load_fasta_sequences(str(fasta))
+    chunked_seqs, chunked_accs = _chunk_sequences(seqs, accessions, chunk_size, overlap)
+    logger.info(f"{len(accessions)} sequence(s) -> {len(chunked_seqs)} chunk(s)")
+
+    # PyRodigal architectural features
+    logger.info("Extracting architectural features (PyRodigal)")
+    arch_feature_names = list(ARCH_FEATURE_NAMES) + ["n_genes"]
+    n_workers = min(multiprocessing.cpu_count(), len(chunked_seqs), num_workers)
+    args_list = [(s, a, arch_feature_names, chunk_size) for s, a in zip(chunked_seqs, chunked_accs)]
+    with ProcessPoolExecutor(max_workers=n_workers) as ex:
+        raw_arch_features = list(tqdm(ex.map(extract_features_worker, args_list), total=len(chunked_seqs), desc="      PyRodigal"))
+
+    features_df_arch = pl.DataFrame(
+        np.array(raw_arch_features, dtype=np.float32),
+        schema=arch_feature_names,
+    ).with_columns(pl.Series("accession", chunked_accs))
+    col_order = ["accession"] + arch_feature_names
+    arch_tsv = output_dir / f"{prefix}.arch_features.tsv"
+    features_df_arch.select(col_order).write_csv(arch_tsv, separator="\t")
+    logger.info(f"Architectural features written to: {arch_tsv}")
+
+    # geNomad MMseqs2
+    genomad_metadata = genomad_db / "genomad_marker_metadata.tsv"
+    if not genomad_metadata.exists():
+        raise click.ClickException(
+            f"geNomad metadata file not found: {genomad_metadata}"
+        )
+    logger.info("Running MMseqs2 against geNomad marker database")
+    seq_dict = dict(zip(chunked_accs, chunked_seqs))
+    marker_hits, _, annotation_rows = extract_genomad_markers(
+        sequences=seq_dict,
+        genomad_db=genomad_db,
+        genomad_metadata=genomad_metadata,
+        return_details=True,
+    )
+    hits_json = output_dir / f"{prefix}.genomad_hits.json"
+    with open(hits_json, "w") as fh:
+        json.dump(marker_hits, fh)
+    logger.info(f"geNomad marker hits written to: {hits_json}")
+
+    gene_table_path = output_dir / f"{prefix}.gene_predictions.tsv"
+    write_annotation_rows(annotation_rows, gene_table_path)
+    logger.info(f"Gene prediction table written to: {gene_table_path}")
+    logger.info("Feature extraction complete.")
+
+
+def _preflight_checks(args: Any) -> None:
+    """Verify required binaries, databases, and model files are present before running."""
+    errors: List[str] = []
+
+    if args.precomputed_features:
+        # Stage 2: skip mmseqs2/genomad checks; verify precomputed files instead
+        feat_dir = pathlib.Path(args.precomputed_features)
+        arch_tsv = feat_dir / f"{args.prefix}.arch_features.tsv"
+        hits_json = feat_dir / f"{args.prefix}.genomad_hits.json"
+        if not arch_tsv.exists():
+            errors.append(
+                f"Precomputed arch features not found: {arch_tsv}. "
+                "Run 'vhamster-features' first."
+            )
+        if not hits_json.exists():
+            errors.append(
+                f"Precomputed geNomad hits not found: {hits_json}. "
+                "Run 'vhamster-features' first."
+            )
+    else:
+        # Full pipeline: check mmseqs2 binary and genomad database
+        if shutil.which("mmseqs") is None:
+            errors.append(
+                "mmseqs2 binary not found in PATH. Install via conda:\n"
+                "    conda install -c bioconda mmseqs2"
+            )
+        genomad_db = pathlib.Path(args.genomad_db)
+        mmseqs_db_type = genomad_db / "genomad_db.dbtype"
+        if not mmseqs_db_type.exists():
+            errors.append(
+                f"geNomad MMseqs2 database not found at {genomad_db / 'genomad_db'}. "
+                "Run 'vhamster-install-models' to download it, or provide --genomad-db."
+            )
+
+    # Per-fold model files (always required)
+    for fold_dir in args.fold_dirs_resolved:
+        if not (fold_dir / "config.json").exists():
+            errors.append(
+                f"Missing config.json in {fold_dir}. Run 'vhamster-install-models'."
+            )
+        adapter_dir = fold_dir / args.checkpoint_subdir
+        if not (adapter_dir / "adapter_config.json").exists():
+            errors.append(
+                f"Missing adapter_config.json in {adapter_dir}. Run 'vhamster-install-models'."
+            )
+        xgb_json = fold_dir / "xgb_stacking_artifacts" / "xgb_stacking_artifacts.json"
+        if not xgb_json.exists():
+            errors.append(
+                f"Missing XGBoost artifacts at {xgb_json}. Run 'vhamster-install-models'."
+            )
+
+    if errors:
+        msg = "\n  ".join(errors)
+        raise click.ClickException(f"Pre-flight validation failed:\n  {msg}")
+
+
+@click.command(context_settings={"help_option_names": ["-h", "--help"]})
+@click.option("--fasta", type=click.Path(path_type=pathlib.Path, exists=True, dir_okay=False), required=True, help="Input FASTA file.")
 @click.option("--output", type=click.Path(path_type=pathlib.Path, file_okay=False), required=True, help="Output directory.")
 @click.option("--prefix", default="vhamster", show_default=True, help="Base filename prefix for outputs.")
 @click.option("-f", "--force", "force", is_flag=True, help="Overwrite output if it exists.")
@@ -591,6 +757,7 @@ def _run(args: Any) -> None:
 @click.option("--batch-size", type=int, default=16, show_default=True, help="Inference batch size.")
 @click.option("--fp16", is_flag=True, help="Use FP16 mixed precision.")
 @click.option("--num-workers", type=int, default=4, show_default=True, help="DataLoader workers.")
+@click.option("--precomputed-features", type=click.Path(path_type=pathlib.Path), default=None, help="Directory containing {prefix}.arch_features.tsv and {prefix}.genomad_hits.json from vhamster-features. Skips MMseqs2 and PyRodigal.")
 @click.option("--aggregate-chunks/--no-aggregate-chunks", default=True, show_default=True, help="Enable/disable genome-level consensus output.")
 @click.option("--verbose", is_flag=True, help="Write per-fold predictions and GLM gate weights to {prefix}.verbose.tsv.")
 def main(
@@ -610,6 +777,7 @@ def main(
     batch_size: int,
     fp16: bool,
     num_workers: int,
+    precomputed_features: Optional[pathlib.Path],
     aggregate_chunks: bool,
     verbose: bool,
 ) -> None:
@@ -617,14 +785,14 @@ def main(
     output_dir.mkdir(parents=True, exist_ok=True)
     log_path = _configure_logging(output_dir, prefix)
 
-    # Go looking for genomad database 
+    # Locate geNomad database (only needed when not using precomputed features)
     if genomad_db is None:
         genomad_db = ensemble_dir / "genomad_db"
-        
-    if not (genomad_db / "genomad_marker_metadata.tsv").exists():
+
+    if precomputed_features is None and not (genomad_db / "genomad_marker_metadata.tsv").exists():
         raise click.ClickException(
             f"geNomad database not found at {genomad_db}. "
-            "Please run 'install_models.py' to download it, or provide an explicit path using --genomad-db."
+            "Run 'vhamster-install-models' to download it, or provide --genomad-db."
         )
 
     args = SimpleNamespace(
@@ -645,6 +813,7 @@ def main(
         batch_size=batch_size,
         fp16=fp16,
         num_workers=num_workers,
+        precomputed_features=precomputed_features,
         aggregate_chunks=aggregate_chunks,
         genome_output=output_dir / f"{prefix}.genomes.tsv",
         verbose=verbose,
@@ -678,6 +847,7 @@ def main(
             calibration_params = str(alt_calib)
 
     logger.info(f"Logging to: {log_path}")
+    _preflight_checks(args)
     _run(args)
 
 
