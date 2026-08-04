@@ -27,6 +27,7 @@ dependencies = [
 
 [project.scripts]
 vhamster = "vhamster:main"
+vhamster-features = "vhamster:features_main"
 vhamster-install-models = "install_models:main"
 
 [tool.setuptools]

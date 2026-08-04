@@ -226,6 +226,36 @@ vhamster \
   --calibration-params /path/to/length_aware_vector_scaling_anchors_toplabel_5.json
 ```
 
+## Two-stage pipeline (HPC)
+
+For large datasets, the CPU-intensive feature extraction (PyRodigal + MMseqs2) and the GPU-intensive GLM inference can be run as two separate jobs. This lets you pipeline batches: one batch's features are computed on a CPU node while the previous batch's GLM inference runs on a GPU node.
+
+**Stage 1 — feature extraction (CPU node, no GPU needed):**
+
+```bash
+vhamster-features \
+  --fasta batch_001.fasta \
+  --output features/batch_001 \
+  --prefix batch_001
+```
+
+This writes:
+- `features/batch_001/batch_001.arch_features.tsv` — per-chunk architectural features
+- `features/batch_001/batch_001.genomad_hits.json` — geNomad marker hits
+- `features/batch_001/batch_001.gene_predictions.tsv` — per-gene annotations
+
+**Stage 2 — GLM inference (GPU node):**
+
+```bash
+vhamster \
+  --fasta batch_001.fasta \
+  --output results/batch_001 \
+  --prefix batch_001 \
+  --precomputed-features features/batch_001
+```
+
+The `--chunk-size` and `--overlap` values must match between the two stages (defaults are the same, so no flags needed if you use defaults for both).
+
 ## Outputs
 
 For prefix `sampleA`, output files are:
