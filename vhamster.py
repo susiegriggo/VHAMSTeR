@@ -34,7 +34,14 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import AutoModel, AutoModelForMaskedLM, AutoTokenizer
 
-__version__ = (pathlib.Path(__file__).resolve().parent / "VERSION").read_text().strip()
+try:
+    from importlib.metadata import version as _pkg_version
+    __version__ = _pkg_version("vhamster")
+except Exception:
+    try:
+        __version__ = (pathlib.Path(__file__).resolve().parent / "VERSION").read_text().strip()
+    except FileNotFoundError:
+        __version__ = "unknown"
 
 # ── src/ on path ──────────────────────────────────────────────────────────────
 _ROOT = pathlib.Path(__file__).resolve().parent
@@ -262,6 +269,13 @@ def _run(args: Any) -> None:
         with open(hits_json) as _fh:
             genomad_marker_dict = json.load(_fh)
         annotation_rows = []
+        gene_pred_src = feat_dir / f"{args.prefix}.gene_predictions.tsv"
+        gene_table_path = args.output_dir / f"{args.prefix}.gene_predictions.tsv"
+        if gene_pred_src.exists():
+            shutil.copy2(gene_pred_src, gene_table_path)
+            logger.info(f"      Gene prediction table copied to: {gene_table_path}")
+        else:
+            logger.warning(f"      Gene prediction table not found in features dir: {gene_pred_src}")
         # still need chunked_seqs for GLM tokenization — re-chunk from FASTA
         seqs, accessions = load_fasta_sequences(str(args.fasta))
         chunked_seqs, chunked_accs = _chunk_sequences(seqs, accessions, args.chunk_size, args.overlap)
