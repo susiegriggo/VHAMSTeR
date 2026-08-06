@@ -207,13 +207,12 @@ vhamster \
   --ensemble-dir /path/to/vhamster_models_v1.2.0
 ```
 
-Benchmark using a single fold (for example, only `fold_3`):
+Run using a single fold (for example, only `fold_3`):
 
 ```bash
 vhamster \
   --fasta /path/to/input.fasta \
   --output /path/to/results_dir \
-  --ensemble-dir /path/to/vhamster_models_v1.2.0 \
   --fold-index 3
 ```
 

@@ -34,7 +34,11 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import AutoModel, AutoModelForMaskedLM, AutoTokenizer
 
-__version__ = (pathlib.Path(__file__).resolve().parent / "VERSION").read_text().strip()
+try:
+    from importlib.metadata import version as _pkg_version
+    __version__ = _pkg_version("vhamster")
+except Exception:
+    __version__ = (pathlib.Path(__file__).resolve().parent / "VERSION").read_text().strip()
 
 # ── src/ on path ──────────────────────────────────────────────────────────────
 _ROOT = pathlib.Path(__file__).resolve().parent
@@ -460,14 +464,25 @@ def _run(args: Any) -> None:
         # Collect Logits
         fold_logits_list = []
         fold_alphas_list = []
+        fold_glm_logits_list = [] if args.verbose else None
+        fold_xgb_logprobs_list = [] if args.verbose else None
         with torch.no_grad():
             for batch in tqdm(dataloader, desc=f"      Inference", leave=False):
                 inputs = {k: v.to(device) for k, v in batch.items() if k not in {'accession', 'labels'}}
+                extra_kwargs = {"return_auxiliary_logits": True} if args.verbose else {}
                 if args.fp16 and device.type == 'cuda':
                     with torch.cuda.amp.autocast():
-                        logits = classifier(**inputs)
+                        outputs = classifier(**inputs, **extra_kwargs)
                 else:
-                    logits = classifier(**inputs)
+                    outputs = classifier(**inputs, **extra_kwargs)
+                if args.verbose:
+                    logits = outputs[0]
+                    glm_batch = outputs[1]
+                    xgb_batch = outputs[2]
+                    fold_glm_logits_list.append(glm_batch.cpu() if glm_batch is not None else None)
+                    fold_xgb_logprobs_list.append(xgb_batch.cpu() if xgb_batch is not None else None)
+                else:
+                    logits = outputs
                 fold_logits_list.append(logits.cpu())
                 if hasattr(classifier, '_last_alpha_batch'):
                     alpha = np.atleast_1d(classifier._last_alpha_batch.flatten())
@@ -481,11 +496,21 @@ def _run(args: Any) -> None:
         per_fold_basic.append({"fold_name": fold_dir.name, "logits": fold_logits, "alphas": fold_alphas})
 
         if args.verbose:
+            if fold_xgb_logprobs_list and all(x is not None for x in fold_xgb_logprobs_list):
+                fold_xgb_probs = np.round(torch.exp(torch.cat(fold_xgb_logprobs_list, dim=0)).numpy(), 4)
+            else:
+                fold_xgb_probs = None
+            if fold_glm_logits_list and all(x is not None for x in fold_glm_logits_list):
+                fold_glm_probs = np.round(F.softmax(torch.cat(fold_glm_logits_list, dim=0), dim=-1).numpy(), 4)
+            else:
+                fold_glm_probs = None
             per_fold_verbose.append({
                 "fold_name": fold_dir.name,
                 "logits": fold_logits,
                 "alphas": fold_alphas,
-                "features": fold_features_dicts
+                "features": fold_features_dicts,
+                "xgb_probs": fold_xgb_probs,
+                "glm_probs": fold_glm_probs,
             })
         if accumulated_logits is None:
             accumulated_logits = fold_logits.clone()
@@ -576,8 +601,14 @@ def _run(args: Any) -> None:
                 for i, col in enumerate(class_cols):
                     row[col] = float(fold_probs[j, i])
 
-                # inject all architecture and marker features 
-                row.update(fold_data["features"][j] )
+                if fold_data.get("xgb_probs") is not None:
+                    for i, col in enumerate(class_cols):
+                        row[f"xgb_{col}"] = float(fold_data["xgb_probs"][j, i])
+                if fold_data.get("glm_probs") is not None:
+                    for i, col in enumerate(class_cols):
+                        row[f"glm_{col}"] = float(fold_data["glm_probs"][j, i])
+                # inject all architecture and marker features
+                row.update(fold_data["features"][j])
 
                 verbose_rows.append(row)
 
