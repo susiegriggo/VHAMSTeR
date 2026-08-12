@@ -365,6 +365,12 @@ def _run(args: Any) -> None:
         xgb2_booster.load_model(str(xgb_artifacts_dir / xgb_spec["xgb2_model"]))
 
         xgb_arch_df = features_df_arch.select(arch_cols_no_frag).fill_null(0.0)
+
+        # Ablate by swapping out gene_desnity feature with nan
+        if "gene_density" in xgb_arch_df.columns:
+            xgb_arch_df = xgb_arch_df.with_columns(pl.lit(np.nan).alias("gene_density"))
+        
+
         x_all_df = pl.concat([xgb_arch_df, xgb1_mf_df], how="horizontal")
         x_euk_df = pl.concat([xgb_arch_df, xgb2_mf_df], how="horizontal")
 
