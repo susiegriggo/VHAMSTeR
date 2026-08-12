@@ -366,14 +366,18 @@ def _run(args: Any) -> None:
 
         xgb_arch_df = features_df_arch.select(arch_cols_no_frag).fill_null(0.0)
 
-        # Ablate by swapping out gene_desnity feature with nan
-        if "gene_density" in xgb_arch_df.columns:
-            xgb_arch_df = xgb_arch_df.with_columns(pl.lit(np.nan).alias("gene_density"))
-        if "gene_density_fwd" in xgb_arch_df.columns:
-            xgb_arch_df = xgb_arch_df.with_columns(pl.lit(np.nan).alias("gene_density_fwd"))
-        if "gene_density_rev" in xgb_arch_df.columns:
-            xgb_arch_df = xgb_arch_df.with_columns(pl.lit(np.nan).alias("gene_density_rev"))
-        
+        # apply ablation masks 
+        density_cols = ['gene_density', 'gene_density_fwd', 'gene_density_rev', 'strand_switch_rate']
+        boundary_cols = ['leaderless_freq', 'short_utr_freq']
+        cols_to_mask = []
+        if args.mask_features in ['density', 'density_plus_boundary']:
+            cols_to_mask.extend(density_cols)
+        if args.mask_features in ['boundary', 'density_plus_boundary']:
+            cols_to_mask.extend(boundary_cols)  
+
+        for col in cols_to_mask:
+            if col in xgb_arch_df.columns:
+                xgb_arch_df = xgb_arch_df.with_columns(pl.lit(float('nan')).alias(col))
 
         x_all_df = pl.concat([xgb_arch_df, xgb1_mf_df], how="horizontal")
         x_euk_df = pl.concat([xgb_arch_df, xgb2_mf_df], how="horizontal")
@@ -818,6 +822,7 @@ def _preflight_checks(args: Any) -> None:
 @click.option("--precomputed-features", type=click.Path(path_type=pathlib.Path), default=None, help="Directory containing {prefix}.arch_features.tsv and {prefix}.genomad_hits.json from vhamster-features. Skips MMseqs2 and PyRodigal.")
 @click.option("--aggregate-chunks/--no-aggregate-chunks", default=True, show_default=True, help="Enable/disable genome-level consensus output.")
 @click.option("--verbose", is_flag=True, help="Write per-fold predictions and GLM gate weights to {prefix}.verbose.tsv.")
+@click.option("--mask-features", type=click.Choice(['none', 'density', 'boundary', 'density_plus_boundary']), default='none', help = 'Conditionally mask out specific feature sets with NaNs for ablation testing')
 def main(
     fasta: pathlib.Path,
     output: pathlib.Path,
@@ -837,6 +842,7 @@ def main(
     num_workers: int,
     mmseqs_threads: int,
     precomputed_features: Optional[pathlib.Path],
+    mask_features: str,
     aggregate_chunks: bool,
     verbose: bool,
 ) -> None:
@@ -876,6 +882,7 @@ def main(
         precomputed_features=precomputed_features,
         aggregate_chunks=aggregate_chunks,
         genome_output=output_dir / f"{prefix}.genomes.tsv",
+        mask_features=mask_features,
         verbose=verbose,
     )
 
