@@ -608,6 +608,9 @@ def _run(args: Any) -> None:
 
     if args.verbose and per_fold_verbose:
         verbose_rows = []
+
+        n_genes_list = features_df_arch.get_column('n_genes').to_list()
+
         for fold_data in per_fold_verbose:
             fold_probs = fold_data["probs"]
             fold_alphas = fold_data["alphas"]
@@ -618,6 +621,7 @@ def _run(args: Any) -> None:
                 row: Dict = {
                     "accession": acc,
                     "fold": fold_data["fold_name"],
+                    "n_genes": n_genes_list[j],
                     "predicted_host": fold_predicted_hosts[j],
                     "confidence": float(fold_confidences[j]),
                     "glm_gate_weight": None if np.isnan(fold_alphas[j]) else float(fold_alphas[j]),
