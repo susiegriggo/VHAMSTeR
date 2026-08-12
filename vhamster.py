@@ -369,6 +369,10 @@ def _run(args: Any) -> None:
         # Ablate by swapping out gene_desnity feature with nan
         if "gene_density" in xgb_arch_df.columns:
             xgb_arch_df = xgb_arch_df.with_columns(pl.lit(np.nan).alias("gene_density"))
+        if "gene_density_fwd" in xgb_arch_df.columns:
+            xgb_arch_df = xgb_arch_df.with_columns(pl.lit(np.nan).alias("gene_density_fwd"))
+        if "gene_density_rev" in xgb_arch_df.columns:
+            xgb_arch_df = xgb_arch_df.with_columns(pl.lit(np.nan).alias("gene_density_rev"))
         
 
         x_all_df = pl.concat([xgb_arch_df, xgb1_mf_df], how="horizontal")
