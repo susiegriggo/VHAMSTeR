@@ -366,7 +366,11 @@ def _run(args: Any) -> None:
 
         xgb_arch_df = features_df_arch.select(arch_cols_no_frag).fill_null(0.0)
 
-        # apply ablation masks 
+        # 1. Build the base DataFrames BEFORE masking
+        x_all_df = pl.concat([xgb_arch_df, xgb1_mf_df], how="horizontal")
+        x_euk_df = pl.concat([xgb_arch_df, xgb2_mf_df], how="horizontal")
+
+        # 2. Determine which columns to mask
         density_cols = ['gene_density', 'gene_density_fwd', 'gene_density_rev', 'strand_switch_rate']
         boundary_cols = ['leaderless_freq', 'short_utr_freq']
         cols_to_mask = []
@@ -375,12 +379,16 @@ def _run(args: Any) -> None:
         if args.mask_features in ['boundary', 'density_plus_boundary']:
             cols_to_mask.extend(boundary_cols)  
 
-        for col in cols_to_mask:
-            if col in xgb_arch_df.columns:
-                xgb_arch_df = xgb_arch_df.with_columns(pl.lit(float('nan')).alias(col))
+        # 3. Apply the mask conditionally based on the target
+        if args.mask_target in ['all', 'xgb1_only']:
+            for col in cols_to_mask:
+                if col in x_all_df.columns:
+                    x_all_df = x_all_df.with_columns(pl.lit(float('nan')).alias(col))
 
-        x_all_df = pl.concat([xgb_arch_df, xgb1_mf_df], how="horizontal")
-        x_euk_df = pl.concat([xgb_arch_df, xgb2_mf_df], how="horizontal")
+        if args.mask_target in ['all', 'xgb2_only']:
+            for col in cols_to_mask:
+                if col in x_euk_df.columns:
+                    x_euk_df = x_euk_df.with_columns(pl.lit(float('nan')).alias(col))
 
         # Add a combine feature dictionary for this fold 
         unique_euk_cols = [c for c in x_euk_df.columns if c not in x_all_df.columns]
@@ -827,6 +835,7 @@ def _preflight_checks(args: Any) -> None:
 @click.option("--aggregate-chunks/--no-aggregate-chunks", default=True, show_default=True, help="Enable/disable genome-level consensus output.")
 @click.option("--verbose", is_flag=True, help="Write per-fold predictions and GLM gate weights to {prefix}.verbose.tsv.")
 @click.option("--mask-features", type=click.Choice(['none', 'density', 'boundary', 'density_plus_boundary']), default='none', help = 'Conditionally mask out specific feature sets with NaNs for ablation testing')
+@click.option("--mask-target", type=click.Choice(['all', 'xgb1_only', 'xgb2_only']), default='all', help='Which XGBoost model to apply the mask to.') # just mask one of the layers of the feature branch 
 def main(
     fasta: pathlib.Path,
     output: pathlib.Path,
@@ -848,6 +857,7 @@ def main(
     precomputed_features: Optional[pathlib.Path],
     mask_features: str,
     aggregate_chunks: bool,
+    mask_target: str,
     verbose: bool,
 ) -> None:
     output_dir = output
@@ -887,6 +897,7 @@ def main(
         aggregate_chunks=aggregate_chunks,
         genome_output=output_dir / f"{prefix}.genomes.tsv",
         mask_features=mask_features,
+        mask_target=mask_target,
         verbose=verbose,
     )
 
