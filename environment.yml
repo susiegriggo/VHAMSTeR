@@ -23,4 +23,3 @@ dependencies:
       - tqdm==4.67.3
       - scikit-learn==1.8.0
       - requests==2.33.1
-      - -e .                   # installs vhamster itself in editable mode
