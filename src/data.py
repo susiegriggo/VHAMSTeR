@@ -18,7 +18,7 @@ import numpy as np
 import random
 import sequences
 from torch.utils.data import Sampler
-from features import ARCH_FEATURE_NAMES_NO_FRAGMENT
+from features import ARCH_FEATURE_NAMES
 
 
 class EpochRedrawProkaryoteSampler(Sampler):
@@ -151,7 +151,7 @@ def load_epoch_fold_data(epoch_dir, use_features=True, xgb_features_filename="xg
 
             # Strictly use the 12 canonical arch features — in canonical order — as gate input.
             # This guarantees training and inference receive the identical feature vector.
-            raw_feature_names = [c for c in ARCH_FEATURE_NAMES_NO_FRAGMENT if c in raw_df.columns]
+            raw_feature_names = [c for c in ARCH_FEATURE_NAMES if c in raw_df.columns]
             if raw_feature_names:
                 raw_feat_df = raw_df.set_index(raw_id_col)[raw_feature_names]
                 raw_feat_df.index = raw_feat_df.index.astype(str)
