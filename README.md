@@ -311,6 +311,22 @@ vhamster --fasta all_seqs.fasta --output out/ --prefix all_seqs
 ## Citation 
 Preprint coming soon! 
 
+## Citation 
+
+**Preprint coming soon!** 
+
+If you use VHAMSTeR in your research, please also cite the foundational tools that power our feature extraction pipeline:
+
+* **geNomad (Viral marker database and specificity concepts):**
+  Camargo, A. P., Roux, S., Schulz, F., Babinski, M., Xu, Y., Hu, B., Chain, P. S. G., Nayfach, S., & Kyrpides, N. C. (2023). Identification of mobile genetic elements with geNomad. *Nature Biotechnology*, 42, 277-280. [https://doi.org/10.1038/s41587-023-01953-y](https://doi.org/10.1038/s41587-023-01953-y)
+
+* **Pyrodigal-gv / Prodigal (Viral gene prediction):**
+  Larralde, M. (2022). Pyrodigal: Python bindings and interface to Prodigal. *Journal of Open Source Software*, 7(72), 4296. [https://doi.org/10.21105/joss.04296](https://doi.org/10.21105/joss.04296)
+  Hyatt, D., Chen, G. L., LoCascio, P. F., Land, M. L., Larimer, F. W., & Hauser, L. J. (2010). Prodigal: prokaryotic gene recognition and translation initiation site identification. *BMC Bioinformatics*, 11(1), 1-11. [https://doi.org/10.1186/1471-2105-11-119](https://doi.org/10.1186/1471-2105-11-119)
+
+* **MMseqs2 (Fast protein sequence search):**
+  Steinegger, M., & Söding, J. (2017). MMseqs2 enables sensitive protein sequence searching for the analysis of massive data sets. *Nature Biotechnology*, 35(11), 1026-1028. [https://doi.org/10.1038/nbt.3988](https://doi.org/10.1038/nbt.3988)
+
 ## License Agreement
 Lawrence Berkeley National Laboratory 
 NON-COMMERCIAL USE ONLY LICENSE
