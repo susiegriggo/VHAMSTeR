@@ -288,7 +288,7 @@ def _run(args: Any) -> None:
     for line in _HAMSTER_TEXT_ART.splitlines():
         logger.info(line)
     logger.info(f"v{__version__}")
-    logger.info("Virus Host Assignment Model using Sequence Transformers and Reading-frame")
+    logger.info("Virus Host Assignment Model using Sequence Transformers and Reading-frames")
     logger.info("=" * 68)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
