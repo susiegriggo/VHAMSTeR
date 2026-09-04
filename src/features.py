@@ -79,49 +79,62 @@ def extract_features(seq: str, genome_name: str, chunk_size: int = 10000) -> Dic
     seq_len_kb = seq_len / 1000.0
     fragment_size = seq_len / chunk_size if chunk_size > 0 else 0.0
     orfs = predict_orfs_with_rbs(seq)
+    n_genes = len(orfs)
     
-    if not orfs:
+    # 1. Handle Zero Genes (Completely non-coding)
+    if n_genes == 0:
         return {
             "genome_name": genome_name, "fragment_size": fragment_size, "n_genes": 0,
-            "strand_switch_rate": 0.0, "coding_density": 0.0, "leaderless_freq": 0.0,
-            "short_utr_freq": 0.0, "no_rbs_freq": 0.0, "sd_bacteroidetes_rbs_freq": 0.0,
-            "sd_canonical_rbs_freq": 0.0, "tatata_rbs_freq": 0.0, "mean_rbs_score": 0.0,
-            "gene_density": 0.0, "gene_density_fwd": 0.0, "gene_density_rev": 0.0,
-            "median_orf_length": 0.0, 'max_orf_length': 0.0
+            "strand_switch_rate": np.nan, "coding_density": 0.0, "leaderless_freq": np.nan,
+            "short_utr_freq": np.nan, "no_rbs_freq": np.nan, "sd_bacteroidetes_rbs_freq": np.nan,
+            "sd_canonical_rbs_freq": np.nan, "tatata_rbs_freq": np.nan, "mean_rbs_score": np.nan,
+            "gene_density": np.nan, "gene_density_fwd": np.nan, "gene_density_rev": np.nan,
+            "median_orf_length": np.nan, 'max_orf_length': np.nan
         }
-    
-    n_switches = sum(o["strand_switch"] for o in orfs)
-    strand_switch_rate = n_switches / len(orfs) if len(orfs) > 1 else 0.0
+
+    # 2. Base calculations (Valid for 1+ genes)
     total_coding_bp = sum(o["end"] - o["start"] for o in orfs)
     coding_density = total_coding_bp / seq_len if seq_len > 0 else 0.0
-    leaderless_freq = sum(o["leaderless"] for o in orfs) / len(orfs)
-    short_utr_freq = sum(o["short_utr"] for o in orfs) / len(orfs)
-    no_rbs_freq = sum(1 for o in orfs if not o["has_rbs"]) / len(orfs)
-    sd_bacteroidetes_rbs_freq = sum(o["is_bacteroidetes_rbs"] for o in orfs) / len(orfs)
-    sd_canonical_rbs_freq = sum(o["is_canonical_rbs"] for o in orfs) / len(orfs)
-    tatata_rbs_freq = sum(o["is_tatata_rbs"] for o in orfs) / len(orfs)
+    no_rbs_freq = sum(1 for o in orfs if not o["has_rbs"]) / n_genes
+    sd_bacteroidetes_rbs_freq = sum(o["is_bacteroidetes_rbs"] for o in orfs) / n_genes
+    sd_canonical_rbs_freq = sum(o["is_canonical_rbs"] for o in orfs) / n_genes
+    tatata_rbs_freq = sum(o["is_tatata_rbs"] for o in orfs) / n_genes
     scores = [o["rbs_score"] for o in orfs if o["has_rbs"]]
-    mean_rbs_score = sum(scores) / len(scores) if scores else 0.0
-    mean_rbs_score = mean_rbs_score / 100.0  # Rescale to match other features
-    gene_density = len(orfs) / seq_len_kb if seq_len_kb > 0 else 0.0
-    n_fwd = sum(1 for o in orfs if o["strand"] == '+')
-    n_rev = sum(1 for o in orfs if o["strand"] == '-')
-    gene_density_fwd = n_fwd / seq_len_kb if seq_len_kb > 0 else 0.0
-    gene_density_rev = n_rev / seq_len_kb if seq_len_kb > 0 else 0.0
-    orf_lengths = [o["length"] for o in orfs]
-    median_orf_length = float(np.median(orf_lengths)) if orf_lengths else 0.0
-    max_orf_length = float(np.max(orf_lengths)) if orf_lengths else 0.0
+    mean_rbs_score = (sum(scores) / len(scores)) / 100.0 if scores else 0.0
     
+    orf_lengths = [o["length"] for o in orfs]
+    median_orf_length = float(np.median(orf_lengths))
+    max_orf_length = float(np.max(orf_lengths))
+
+    # 3. Apply the Ablation Mask for N = 1
+    if n_genes == 1:
+        strand_switch_rate = np.nan
+        short_utr_freq = np.nan
+        gene_density = np.nan
+        gene_density_fwd = np.nan
+        gene_density_rev = np.nan
+        leaderless_freq = np.nan
+    else:
+        # Standard relational/density calculations for N > 1
+        n_switches = sum(o["strand_switch"] for o in orfs)
+        strand_switch_rate = n_switches / n_genes
+        short_utr_freq = sum(o["short_utr"] for o in orfs) / n_genes
+        leaderless_freq = sum(o["leaderless"] for o in orfs) / n_genes
+        gene_density = n_genes / seq_len_kb if seq_len_kb > 0 else 0.0
+        n_fwd = sum(1 for o in orfs if o["strand"] == '+')
+        n_rev = sum(1 for o in orfs if o["strand"] == '-')
+        gene_density_fwd = n_fwd / seq_len_kb if seq_len_kb > 0 else 0.0
+        gene_density_rev = n_rev / seq_len_kb if seq_len_kb > 0 else 0.0
+
     return {
-        "genome_name": genome_name, "fragment_size": fragment_size, "n_genes": len(orfs),
+        "genome_name": genome_name, "fragment_size": fragment_size, "n_genes": n_genes,
         "strand_switch_rate": strand_switch_rate, "coding_density": coding_density,
         "leaderless_freq": leaderless_freq, "short_utr_freq": short_utr_freq,
         "no_rbs_freq": no_rbs_freq, "sd_bacteroidetes_rbs_freq": sd_bacteroidetes_rbs_freq,
         "sd_canonical_rbs_freq": sd_canonical_rbs_freq, "tatata_rbs_freq": tatata_rbs_freq,
         "mean_rbs_score": mean_rbs_score, "gene_density": gene_density,
         "gene_density_fwd": gene_density_fwd, "gene_density_rev": gene_density_rev,
-        "median_orf_length": median_orf_length, 
-        "max_orf_length": max_orf_length
+        "median_orf_length": median_orf_length, "max_orf_length": max_orf_length
     }
 
 def extract_features_worker(args):
@@ -356,7 +369,7 @@ def build_gate_context_features(
                         raise ValueError(f"Cutoff for marker {m} is missing")
                     spec_bits.append(bs / cutoff)
                     
-        total_spec_freq = len(spec_bits) / denom
+        total_spec_freq = float(len(spec_bits)) 
         spec_median = float(np.median(spec_bits)) if spec_bits else np.nan
         spec_max = float(np.max(spec_bits)) if spec_bits else np.nan
         

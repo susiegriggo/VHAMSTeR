@@ -587,6 +587,15 @@ class GenomeClassifier(nn.Module):
             gate_input = torch.cat(gate_parts, dim=-1)
             alpha = torch.sigmoid(self.dynamic_gate(gate_input))
             
+            # force 100% glm if there are no genes that are detected 
+            if gate_marker is not None:
+
+                # Ensure the mask shape [B, 1] matches the alpha shape [B, 1]
+                n_genes_mask = (gate_marker[:, 0] == 0).unsqueeze(-1)
+    
+                # Out of place replacement to avoid in-place operation on alpha
+                alpha = torch.where(n_genes_mask, torch.ones_like(alpha), alpha)
+                
             if not self.training:
                 self._last_alpha_batch = alpha.detach().cpu().numpy().squeeze()
                 self._last_alpha_mean = alpha.mean().item()
