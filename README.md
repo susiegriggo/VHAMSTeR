@@ -7,12 +7,9 @@
 VHAMSTeR uses a genomic language model to predict the host of a virus as one of: animal, plant, fungi, protist, or prokaryote.
 
 It is designed for viral sequences up to 10 kbp. Longer sequences are split
-into 10 kbp chunks, each chunk is scored independently, and the chunk predictions are
-mean-pooled to produce a genome-level consensus prediction.
-
-It runs a 5-fold ensemble and writes:
-- chunk-level predictions (10kbp)
-- genome-level consensus predictions (mean-pooled over chunks)
+into 10 kbp chunks (with a `_chunk<start>_<end>` suffix appended to the accession). 
+Each chunk is scored independently, and the chunk predictions are mean-pooled to 
+produce a genome-level consensus prediction.
 
 ## Dependencies
 
@@ -91,20 +88,21 @@ want GPU support, edit the `pytorch-cuda` version to match your cluster before r
 ```bash
 conda env create -f environment.yml
 conda activate vhamster
+pip install -e .
 ```
 
 ## Model installation
 
 Model installation is a separate step after installing `vhamster` itself.
 
-This downloads the pretrained model weights from [HuggingFace](https://huggingface.co/DOEJGI/vhamster-models-v1.2.0) and the geNomad marker database from [Zenodo](https://zenodo.org/records/14886553):
+This downloads the pretrained model weights from [HuggingFace](https://huggingface.co/DOEJGI/vhamster-models) and the geNomad marker database from [Zenodo](https://zenodo.org/records/14886553):
 
 ```bash
 vhamster-install-models
 ```
 
 By default, everything is installed into an environment-scoped location in the active Python
-environment: `site-packages/vhamster_models_v1.2.0`.
+environment: `site-packages/vhamster_models_v1.3.0`.
 
 If that default location is not writable, install to your own directory instead:
 
@@ -120,7 +118,7 @@ vhamster-install-models -f
 
 The installer places files at:
 - `<install_root>/fold_0/` … `<install_root>/fold_4/` — ensemble model weights
-- `<install_root>/length_aware_vector_scaling_anchors_toplabel_5.json` — calibration parameters
+- `<install_root>/proportional_vector_scaling_scalar_nll_notclassbalanced_posthoc_fungi_nolength.json` — calibration parameters
 - `<install_root>/genomad_db/` — geNomad marker database
 
 Once installed, vhamster will find the geNomad database automatically. If you have an existing geNomad database elsewhere, you can point to it with `--genomad-db`:
@@ -138,7 +136,7 @@ If your models are stored in a non-default location, pass the path with `--ensem
 vhamster \
   --fasta input.fasta \
   --output results/ \
-  --ensemble-dir /path/to/vhamster_models_v1.2.0
+  --ensemble-dir /path/to/vhamster_models_v1.3.0
 ```
 
 Runtime logs are written to `<output>/<prefix>.log` and also shown in the
@@ -164,7 +162,7 @@ vhamster \
   --fasta test_data/escherichia_phage.fasta \
   --output results/test_run \
   --prefix escherichia_phage \
-  --ensemble-dir /path/to/vhamster_models_v1.2.0
+  --ensemble-dir /path/to/vhamster_models_v1.3.0
 ```
 
 This writes two files:
@@ -204,7 +202,7 @@ Use a custom ensemble directory:
 vhamster \
   --fasta /path/to/input.fasta \
   --output /path/to/results_dir \
-  --ensemble-dir /path/to/vhamster_models_v1.2.0
+  --ensemble-dir /path/to/vhamster_models_v1.3.0
 ```
 
 Run using a single fold (for example, only `fold_3`):
@@ -222,7 +220,7 @@ Use a non-default calibration parameters file:
 vhamster \
   --fasta /path/to/input.fasta \
   --output /path/to/results_dir \
-  --calibration-params /path/to/length_aware_vector_scaling_anchors_toplabel_5.json
+  --calibration-params /path/to/proportional_vector_scaling_scalar_nll_notclassbalanced_posthoc_fungi_nolength.json
 ```
 
 ## Two-stage pipeline (HPC)
@@ -255,25 +253,63 @@ vhamster \
 
 The `--chunk-size` and `--overlap` values must match between the two stages (defaults are the same, so no flags needed if you use defaults for both).
 
+
 ## Outputs
 
-For prefix `sampleA`, output files are:
+For prefix `sampleA`, the unconditional output files are:
 - `/path/to/results_dir/sampleA.chunks.tsv` — per-chunk predictions
 - `/path/to/results_dir/sampleA.genomes.tsv` — genome-level consensus (mean-pooled over chunks)
 - `/path/to/results_dir/sampleA.folds.tsv` — per-fold predictions and GLM gate weights for all 5 ensemble members
 
-Chunk file columns include:
-- accession, predicted_host, confidence
-- class probability columns
-- prokaryote_score, eukaryote_score
+If the `--verbose` flag is passed, an additional file is generated:
+- `/path/to/results_dir/sampleA.verbose.tsv` — detailed per-fold uncalibrated stream probabilities, uncalibrated ensemble probabilities, and raw feature arrays.
 
-Genome file columns include:
-- genome, predicted_host, confidence
+### Chunk Naming Convention
+Sequences longer than the specified chunk size (default 10 kbp) are split into smaller fragments. The `accession` column for these fragments will include a `_chunk<start>_<end>` suffix (e.g., `NC_007026.1_chunk0_10000`). You can use this suffix or the `sampleA.genomes.tsv` file to join chunk-level predictions back to your original input sequences.
 
-Folds file columns include:
-- accession, fold, predicted_host, confidence, glm_gate_weight
-- class probability columns
+### File Schemas
 
+**Chunk file columns include:**
+- `accession`, `predicted_host`, `confidence`
+- calibrated class probability columns
+- `prokaryote_score`, `eukaryote_score`
+
+**Genome file columns include:**
+- `genome`, `predicted_host`, `confidence`
+- calibrated class probability columns
+- `prokaryote_score`, `eukaryote_score`
+
+**Folds file columns include:**
+- `accession`, `fold`, `predicted_host`, `confidence`, `glm_gate_weight`
+- calibrated class probability columns
+
+**Verbose file columns include:**
+- `accession`, `fold`, `n_genes`, `predicted_host`, `confidence`, `glm_gate_weight`
+- calibrated class probability columns
+- `xgb_<class>` (pure, uncalibrated XGBoost probabilities)
+- `glm_<class>` (pure, uncalibrated GLM probabilities)
+- `uncalibrated_ensemble_<class>` (the exact mathematical output of the dynamic gate before temperature scaling)
+- All raw architectural and marker features
+
+## Performance & Batching Tips
+
+**1. Batch your inputs into a single FASTA file**
+The geNomad marker search relies on MMseqs2, which has a high fixed startup cost (often 1–2 minutes) to load the marker database into memory. This cost is incurred every time `vhamster` runs. 
+
+To avoid paying this startup penalty multiple times, **do not run vhamster in a bash loop over individual files**. Instead, concatenate your sequences into a single multi-FASTA file and run `vhamster` once:
+
+```
+# Inefficient (Loads DB 3 times)
+vhamster --fasta seq1.fasta --output out/ --prefix seq1
+vhamster --fasta seq2.fasta --output out/ --prefix seq2
+vhamster --fasta seq3.fasta --output out/ --prefix seq3
+
+# Highly Efficient (Loads DB once)
+cat seq1.fasta seq2.fasta seq3.fasta > all_seqs.fasta
+vhamster --fasta all_seqs.fasta --output out/ --prefix all_seqs
+```
+## Citation 
+Preprint coming soon! 
 
 ## License Agreement
 Lawrence Berkeley National Laboratory 

@@ -59,6 +59,30 @@ from models import GenomeClassifier, load_model_and_tokenizer, make_collate_fn
 from sequences import GenomeDataset, load_fasta_sequences
 
 
+_HAMSTER_TEXT_ART = r"""
+
+888     888 888    888        d8888 888b     d888  .d8888b. 88888888888        8888888b.  
+888     888 888    888       d88888 8888b   d8888 d88P  Y88b    888            888   Y88b 
+888     888 888    888      d88P888 88888b.d88888 Y88b.         888            888    888 
+Y88b   d88P 8888888888     d88P 888 888Y88888P888  "Y888b.      888   .d88b.   888   d88P 
+ Y88b d88P  888    888    d88P  888 888 Y888P 888     "Y88b.    888  d8P  Y8b  8888888P"  
+  Y88o88P   888    888   d88P   888 888  Y8P  888       "888    888  88888888  888 T88b   
+   Y888P    888    888  d8888888888 888   "   888 Y88b  d88P    888  Y8b.      888  T88b  
+    Y8P     888    888 d88P     888 888       888  "Y8888P"     888   "Y8888   888   T88b                                                                     
+                                                                              
+""".strip("\n")
+
+_HAMSTER_FACE_ART = r"""
+                                                                                                    
+                c._
+      ."````"-"C  o'-.
+    _/   \       _..'
+   '-\  _/--.<<-'
+      `\)     \)  
+                                                                                                                                                                                
+""".strip("\n")
+
+
 def _default_model_root() -> pathlib.Path:
     purelib = sysconfig.get_path("purelib")
     if purelib is None:
@@ -261,7 +285,9 @@ def _configure_logging(output_dir: pathlib.Path, prefix: str) -> pathlib.Path:
 
 def _run(args: Any) -> None:
     logger.info("=" * 68)
-    logger.info(f"VHAMSTeR v{__version__}")
+    for line in _HAMSTER_TEXT_ART.splitlines():
+        logger.info(line)
+    logger.info(f"v{__version__}")
     logger.info("Virus Host Assignment Model using Sequence Transformers and Reading-frame")
     logger.info("=" * 68)
 
@@ -709,6 +735,8 @@ def _run(args: Any) -> None:
         df_verbose.write_csv(verbose_path, separator="\t")
         logger.info(f"Verbose per-fold predictions written to: {verbose_path}")
 
+    for line in _HAMSTER_FACE_ART.splitlines():
+        logger.info(line)
     logger.info("Done!")
 
 @click.command(context_settings={"help_option_names": ["-h", "--help"]})

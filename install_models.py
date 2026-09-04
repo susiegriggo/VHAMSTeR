@@ -23,7 +23,7 @@ from loguru import logger
 import click
 
 
-HF_REPO_ID = "DOEJGI/vhamster-models-v1.2.0"
+HF_REPO_ID = "DOEJGI/vhamster-models"
 
 # Only the MMseqs2 database and metadata are needed — vhamster does not use
 # the HMM or MSA files from the full geNomad bundle.
@@ -42,8 +42,8 @@ GENOMAD_FILES = [
 ]
 
 REQUIRED_MODEL_FILES = ["fold_0", "fold_1", "fold_2", "fold_3", "fold_4"]
-REQUIRED_ROOT_FILES = ["length_aware_vector_scaling_anchors_toplabel_5.json"]
-DEFAULT_MODEL_DIRNAME = "vhamster_models_v1.2.0"
+REQUIRED_ROOT_FILES = ["proportional_vector_scaling_scalar_nll_notclassbalanced_posthoc_fungi_nolength.json"]
+DEFAULT_MODEL_DIRNAME = "vhamster_models_v1.3.0"
 
 
 def configure_logging(debug: bool = False):
@@ -64,12 +64,14 @@ def get_default_model_dir() -> str:
 
 def check_model_installation(model_dir: str) -> bool:
     for file_name in REQUIRED_ROOT_FILES:
-        if not os.path.isfile(os.path.join(model_dir, file_name)):
-            logger.warning(f"Required file missing: {file_name}")
+        file_path = os.path.join(model_dir, file_name)
+        if not os.path.isfile(file_path):
+            logger.warning(f"Required file missing: {file_path}")
             return False
     for fold_name in REQUIRED_MODEL_FILES:
-        if not os.path.isdir(os.path.join(model_dir, fold_name)):
-            logger.warning(f"Fold directory missing: {fold_name}")
+        fold_path = os.path.join(model_dir, fold_name)
+        if not os.path.isdir(fold_path):
+            logger.warning(f"Fold directory missing: {fold_path}")
             return False
     logger.info("All required model files are present")
     return True
@@ -110,10 +112,10 @@ def get_models_huggingface(model_dir: str):
     abs_path = os.path.abspath(model_dir)
     logger.info(f"Downloading VHAMSTeR models from HuggingFace ({HF_REPO_ID})")
     try:
-        snapshot_download(repo_id=HF_REPO_ID, repo_type="model", local_dir=abs_path)
+        snapshot_download(repo_id=HF_REPO_ID, repo_type="model", local_dir=abs_path, revision='v1.3.0')
     except Exception as e:
         logger.error(f"Download failed: {e}")
-        sys.exit(f"Could not download models from HuggingFace.\n{e}")
+        sys.exit(f"Coul d not download models from HuggingFace.\n{e}")
     logger.info("Model download complete.")
 
 
