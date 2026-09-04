@@ -3,8 +3,8 @@
 VHAMSTeR
 ==============================================================
 Virus Host Assignment Model using Sequence Transformers and Reading-frames.
-Runs 5-fold deep ensemble inference with per-fold XGBoost stacking 
-and applies length-aware continuous vector calibration.
+Runs 5-fold deep ensemble inference with per-fold XGBoost stacking
+and applies post-hoc vector-scaling probability calibration.
 """
 
 import gc
@@ -29,12 +29,18 @@ import torch.nn.functional as F
 import xgboost as xgb
 from loguru import logger
 from peft import PeftModel
-from torch import nn
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
-from transformers import AutoModel, AutoModelForMaskedLM, AutoTokenizer
+from transformers import AutoTokenizer
 
-__version__ = (pathlib.Path(__file__).resolve().parent / "VERSION").read_text().strip()
+try:
+    from importlib.metadata import version as _pkg_version
+    __version__ = _pkg_version("vhamster")
+except Exception:
+    try:
+        __version__ = (pathlib.Path(__file__).resolve().parent / "VERSION").read_text().strip()
+    except FileNotFoundError:
+        __version__ = "unknown"
 
 # ── src/ on path ──────────────────────────────────────────────────────────────
 _ROOT = pathlib.Path(__file__).resolve().parent
@@ -53,11 +59,35 @@ from models import GenomeClassifier, load_model_and_tokenizer, make_collate_fn
 from sequences import GenomeDataset, load_fasta_sequences
 
 
+_HAMSTER_TEXT_ART = r"""
+
+888     888 888    888        d8888 888b     d888  .d8888b. 88888888888        8888888b.  
+888     888 888    888       d88888 8888b   d8888 d88P  Y88b    888            888   Y88b 
+888     888 888    888      d88P888 88888b.d88888 Y88b.         888            888    888 
+Y88b   d88P 8888888888     d88P 888 888Y88888P888  "Y888b.      888   .d88b.   888   d88P 
+ Y88b d88P  888    888    d88P  888 888 Y888P 888     "Y88b.    888  d8P  Y8b  8888888P"  
+  Y88o88P   888    888   d88P   888 888  Y8P  888       "888    888  88888888  888 T88b   
+   Y888P    888    888  d8888888888 888   "   888 Y88b  d88P    888  Y8b.      888  T88b  
+    Y8P     888    888 d88P     888 888       888  "Y8888P"     888   "Y8888   888   T88b                                                                     
+                                                                              
+""".strip("\n")
+
+_HAMSTER_FACE_ART = r"""
+                                                                                                    
+                c._
+      ."````"-"C  o'-.
+    _/   \       _..'
+   '-\  _/--.<<-'
+      `\)     \)  
+                                                                                                                                                                                
+""".strip("\n")
+
+
 def _default_model_root() -> pathlib.Path:
     purelib = sysconfig.get_path("purelib")
     if purelib is None:
         return _ROOT / "model"
-    return pathlib.Path(purelib) / "vhamster_models_v1.2.0"
+    return pathlib.Path(purelib) / "vhamster_models_v1.3.0"
 
 
 _DEFAULT_MODEL_ROOT = _default_model_root()
@@ -91,59 +121,72 @@ def _discover_fold_dirs(args: Any) -> List[pathlib.Path]:
 
 
 def _load_fold_config(fold_dir: pathlib.Path, checkpoint_subdir: str) -> Dict:
-    candidates = [
-        fold_dir / "config.json",
-        fold_dir / checkpoint_subdir / "config.json",
-    ]
-    for cfg in candidates:
-        if cfg.exists():
-            with open(cfg, "r", encoding="utf-8") as f:
-                return json.load(f)
-    raise FileNotFoundError(f"No config.json found for fold {fold_dir}. Tried: {[str(c) for c in candidates]}")
-
+    # Strictly enforce reading from the intended checkpoint directory
+    cfg = fold_dir / "config.json"
+    if cfg.exists():
+        with open(cfg, "r", encoding="utf-8") as f:
+            return json.load(f)
+    raise FileNotFoundError(f"Strict mode: No config.json found at {cfg}")
 
 def _load_calibration_params(path: Optional[Union[str, pathlib.Path]]) -> Optional[Dict]:
-    """Load vector scaling parameters (w0, w1, length_scale) from JSON."""
+    """Load calibration parameters (base per-class w0/w1, length_scale, optional posthoc_top_label) from JSON."""
     if path is None:
-        return None
+        raise ValueError("Strict mode: A calibration JSON path must be provided.")
     p = pathlib.Path(str(path))
     if not p.exists():
-        logger.warning(f"Calibration JSON not found: {p}. Using uncalibrated logits.")
-        return None
+        raise FileNotFoundError(f"Strict mode: Calibration JSON not found: {p}")
     with open(p, "r", encoding="utf-8") as f:
         data = json.load(f)
-    logger.info(f"Loaded length-aware vector scaling parameters from {p}")
+    logger.info(f"Loaded calibration parameters from {p}")
     return data
 
-
 def _apply_calibration(logits: torch.Tensor, calib_params: Optional[Dict], chunk_lengths: List[int], num_classes: int) -> np.ndarray:
-    """Apply length-aware vector scaling calibration to a set of logits."""
-    if calib_params and "classes" in calib_params:
-        length_scale = float(calib_params.get("length_scale", 1000.0))
-        w0 = torch.tensor([calib_params["classes"].get(str(c), {"w0": 0.0})["w0"] for c in range(num_classes)], dtype=torch.float32)
-        w1 = torch.tensor([calib_params["classes"].get(str(c), {"w1": 0.0})["w1"] for c in range(num_classes)], dtype=torch.float32)
-        lengths_tensor = torch.tensor(chunk_lengths, dtype=torch.float32).clamp(min=1e-6)
-        log_norm_lengths = torch.log(lengths_tensor / length_scale)
-        temps = torch.exp(w0.unsqueeze(0) + w1.unsqueeze(0) * log_norm_lengths.unsqueeze(1))
+    """Apply base per-class vector scaling, then an optional single-class post-hoc top-label correction.
 
-        raw_probs = torch.softmax(logits, dim=-1)
-        pred_cls = torch.argmax(logits, dim=-1)
-        n = logits.shape[0]
-        idx = torch.arange(n)
-        top_temp = temps[idx, pred_cls]
-        top_raw = raw_probs[idx, pred_cls]
-        top_raw_clamp = top_raw.clamp(min=1e-7, max=1.0 - 1e-7)
-        bce_logit = torch.log(top_raw_clamp / (1.0 - top_raw_clamp))
-        cal_top = torch.sigmoid(bce_logit / top_temp)
-        remaining_raw = (1.0 - top_raw).clamp(min=1e-8)
-        remaining_cal = (1.0 - cal_top).clamp(min=0.0)
-        scale = (remaining_cal / remaining_raw).unsqueeze(1)
-        final_probs = raw_probs * scale
-        final_probs[idx, pred_cls] = cal_top
-        final_probs = final_probs / final_probs.sum(dim=-1, keepdim=True)
-        return np.round(final_probs.numpy(), 4)
-    else:
+    Stage 1 (base): each class c has a temperature T_c(L) = exp(w0_c + w1_c * log(L / length_scale))
+    (w1_c == 0 for classes fit without length-awareness). Logits are divided by T_c and softmax'd
+    jointly across all classes.
+
+    Stage 2 (optional post-hoc): if calib_params["posthoc_top_label"] is enabled, fragments whose
+    predicted class equals its target_class have their top-1 probability further rescaled by a
+    second temperature and the remaining mass proportionally redistributed, leaving all other
+    fragments/classes untouched.
+    """
+    if not (calib_params and "classes" in calib_params):
         return np.round(torch.softmax(logits, dim=-1).numpy(), 4)
+
+    length_scale = float(calib_params.get("length_scale", 1000.0))
+    w0 = torch.tensor([calib_params["classes"].get(str(c), {"w0": 0.0}).get("w0", 0.0) for c in range(num_classes)], dtype=torch.float32)
+    w1 = torch.tensor([calib_params["classes"].get(str(c), {"w1": 0.0}).get("w1", 0.0) for c in range(num_classes)], dtype=torch.float32)
+    lengths_tensor = torch.tensor(chunk_lengths, dtype=torch.float32).clamp(min=1e-6)
+    log_norm_lengths = torch.log(lengths_tensor / length_scale)
+    temps = torch.exp(w0.unsqueeze(0) + w1.unsqueeze(0) * log_norm_lengths.unsqueeze(1))
+
+    probs = torch.softmax(logits / temps, dim=-1)
+
+    posthoc = calib_params.get("posthoc_top_label")
+    if posthoc and posthoc.get("enabled", False):
+        target_class = int(posthoc["target_class"])
+        post_w0 = float(posthoc["w0"])
+        post_w1 = float(posthoc.get("w1", 0.0))
+
+        pred_cls = torch.argmax(probs, dim=-1)
+        mask = pred_cls == target_class
+        if mask.any():
+            top_raw = probs[mask, target_class].clamp(min=1e-7, max=1.0 - 1e-7)
+            bce_logit = torch.log(top_raw / (1.0 - top_raw))
+            post_temp = torch.exp(post_w0 + post_w1 * log_norm_lengths[mask])
+            top_cal = torch.sigmoid(bce_logit / post_temp)
+
+            remaining_raw = (1.0 - top_raw).clamp(min=1e-8)
+            remaining_cal = (1.0 - top_cal).clamp(min=0.0)
+            scale = (remaining_cal / remaining_raw).unsqueeze(1)
+
+            corrected = probs[mask] * scale
+            corrected[:, target_class] = top_cal
+            probs[mask] = corrected / corrected.sum(dim=-1, keepdim=True)
+
+    return np.round(probs.numpy(), 4)
 
 
 def _reconstruct_hierarchical_probs(xgb1_probs, xgb2_probs, n_fine_classes, prokaryote_idx, euk_fine_indices):
@@ -153,6 +196,22 @@ def _reconstruct_hierarchical_probs(xgb1_probs, xgb2_probs, n_fine_classes, prok
     for euk_col, fine_col in enumerate(euk_fine_indices):
         out[:, fine_col] = p_euk * xgb2_probs[:, euk_col]
     return out
+
+
+def _select_xgb_features(df: pl.DataFrame, feature_names: Optional[List[str]], model_label: str) -> np.ndarray:
+    """Select/order columns to match a loaded XGBoost model's expected feature set."""
+    if not feature_names:
+        raise click.ClickException(
+            f"{model_label} has no stored feature_names, so its expected feature columns "
+            "cannot be determined."
+        )
+    missing = [n for n in feature_names if n not in df.columns]
+    if missing:
+        raise click.ClickException(
+            f"{model_label} expects feature(s) not present in the constructed feature "
+            f"matrix: {missing}. Available columns: {df.columns}"
+        )
+    return df.select(feature_names).to_numpy().astype(np.float32)
 
 
 def _aggregate_chunks(
@@ -193,7 +252,6 @@ def _aggregate_chunks(
         ])
 
     lead_cols = ["genome", "predicted_host", "confidence"]
-    #rest = [c for c in genome_df.columns if c not in lead_cols]
     return genome_df.select(lead_cols)
 
 
@@ -227,8 +285,10 @@ def _configure_logging(output_dir: pathlib.Path, prefix: str) -> pathlib.Path:
 
 def _run(args: Any) -> None:
     logger.info("=" * 68)
-    logger.info(f"VHAMSTeR v{__version__}")
-    logger.info("Virus Host Assignment Model using Sequence Transformers and Reading-frame")
+    for line in _HAMSTER_TEXT_ART.splitlines():
+        logger.info(line)
+    logger.info(f"v{__version__}")
+    logger.info("Virus Host Assignment Model using Sequence Transformers and Reading-frames")
     logger.info("=" * 68)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -262,9 +322,13 @@ def _run(args: Any) -> None:
         with open(hits_json) as _fh:
             genomad_marker_dict = json.load(_fh)
         annotation_rows = []
-        # still need chunked_seqs for GLM tokenization — re-chunk from FASTA
-        seqs, accessions = load_fasta_sequences(str(args.fasta))
-        chunked_seqs, chunked_accs = _chunk_sequences(seqs, accessions, args.chunk_size, args.overlap)
+        gene_pred_src = feat_dir / f"{args.prefix}.gene_predictions.tsv"
+        gene_table_path = args.output_dir / f"{args.prefix}.gene_predictions.tsv"
+        if gene_pred_src.exists():
+            shutil.copy2(gene_pred_src, gene_table_path)
+            logger.info(f"      Gene prediction table copied to: {gene_table_path}")
+        else:
+            logger.warning(f"      Gene prediction table not found in features dir: {gene_pred_src}")
         if chunked_accs != precomp_accs:
             raise click.ClickException(
                 "Chunk accessions in precomputed features do not match the current FASTA + "
@@ -293,13 +357,15 @@ def _run(args: Any) -> None:
                 "Ensure you are passing the root directory of a complete geNomad database."
             )
 
-        logger.info("      Running MMseqs2 against geNomad marker database...")
+        mmseqs_threads = args.mmseqs_threads
+        logger.info(f"      Running MMseqs2 against geNomad marker database ({mmseqs_threads} threads)...")
         seq_dict = dict(zip(chunked_accs, chunked_seqs))
 
         marker_hits, _, annotation_rows = extract_genomad_markers(
             sequences=seq_dict,
             genomad_db=args.genomad_db,
             genomad_metadata=genomad_metadata,
+            threads=mmseqs_threads,
             return_details=True,
         )
         genomad_marker_dict = marker_hits
@@ -313,6 +379,7 @@ def _run(args: Any) -> None:
     # ── [4/5] Ensemble Inference Loop ────────────────────────────────────────
     logger.info("[4/5] Running ensemble inference across folds")
     accumulated_logits: Optional[torch.Tensor] = None
+    accumulated_xgb_probs: Optional[np.ndarray] = None
     per_fold_basic: List[Dict] = []
     per_fold_verbose: List[Dict] = [] if args.verbose else None
 
@@ -343,30 +410,55 @@ def _run(args: Any) -> None:
         xgb2_mf_df = build_xgb2_marker_features(chunked_accs, marker_hits, marker_classification, cutoff_dict, features_df_arch)
 
         # 4c. Load & Run Fold XGBoost Models
-        xgb1_booster = xgb.Booster()
-        xgb2_booster = xgb.Booster()
-        xgb1_booster.load_model(str(xgb_artifacts_dir / xgb_spec["xgb1_model"]))
-        xgb2_booster.load_model(str(xgb_artifacts_dir / xgb_spec["xgb2_model"]))
+        xgb1_model = xgb.XGBClassifier()
+        xgb2_model = xgb.XGBClassifier()
 
-        xgb_arch_df = features_df_arch.select(arch_cols_no_frag).fill_null(0.0)
+        # Add these two lines to bypass the sklearn validation
+        xgb1_model._estimator_type = "classifier"
+        xgb2_model._estimator_type = "classifier"
+
+        xgb1_model.load_model(str(xgb_artifacts_dir / xgb_spec["xgb1_model"]))
+        xgb2_model.load_model(str(xgb_artifacts_dir / xgb_spec["xgb2_model"]))
+
+        xgb_arch_df = features_df_arch.select(arch_cols_no_frag)
+
+        # 1. Build the base DataFrames (features_3.py already applies NaNs!)
         x_all_df = pl.concat([xgb_arch_df, xgb1_mf_df], how="horizontal")
         x_euk_df = pl.concat([xgb_arch_df, xgb2_mf_df], how="horizontal")
+
+        # 2. Apply Ablation Masks ONLY (if requested)
+        density_cols = ['gene_density', 'gene_density_fwd', 'gene_density_rev', 'strand_switch_rate']
+        boundary_cols = ['leaderless_freq', 'short_utr_freq']
+        cols_to_mask = []
+        if args.mask_features in ['density', 'density_plus_boundary']:
+            cols_to_mask.extend(density_cols)
+        if args.mask_features in ['boundary', 'density_plus_boundary']:
+            cols_to_mask.extend(boundary_cols)  
+
+        if args.mask_target in ['all', 'xgb1_only']:
+            for col in cols_to_mask:
+                if col in x_all_df.columns:
+                    x_all_df = x_all_df.with_columns(pl.lit(float('nan')).alias(col))
+
+        if args.mask_target in ['all', 'xgb2_only']:
+            for col in cols_to_mask:
+                if col in x_euk_df.columns:
+                    x_euk_df = x_euk_df.with_columns(pl.lit(float('nan')).alias(col))
 
         # Add a combine feature dictionary for this fold 
         unique_euk_cols = [c for c in x_euk_df.columns if c not in x_all_df.columns]
         fold_features_df = pl.concat([x_all_df, x_euk_df.select(unique_euk_cols)], how="horizontal")
         fold_features_dicts = fold_features_df.to_dicts()
 
-        exp_xgb1 = xgb1_booster.feature_names
-        exp_xgb2 = xgb2_booster.feature_names
-        x_all = x_all_df.select(exp_xgb1).to_numpy() if exp_xgb1 else x_all_df.to_numpy()
-        x_euk = x_euk_df.select(exp_xgb2).to_numpy() if exp_xgb2 else x_euk_df.to_numpy()
+        # 3. XGBoost Predictions
+        expected_xgb1 = xgb_spec["feature_columns_xgb1"]
+        x_all = _select_xgb_features(x_all_df, expected_xgb1, "xgb1")
 
-        raw1 = xgb1_booster.predict(xgb.DMatrix(x_all))
-        xgb1_probs = np.column_stack([1.0 - raw1, raw1]) if raw1.ndim == 1 else raw1
+        expected_xgb2 = xgb_spec["feature_columns_xgb2"]
+        x_euk = _select_xgb_features(x_euk_df, expected_xgb2, "xgb2")
 
-        raw2 = xgb2_booster.predict(xgb.DMatrix(x_euk))
-        xgb2_probs = np.column_stack([1.0 - raw2, raw2]) if raw2.ndim == 1 else raw2
+        xgb1_probs = xgb1_model.predict_proba(x_all)
+        xgb2_probs = xgb2_model.predict_proba(x_euk)
 
         xgb_probs = _reconstruct_hierarchical_probs(
             xgb1_probs, xgb2_probs,
@@ -375,7 +467,7 @@ def _run(args: Any) -> None:
             [int(i) for i in xgb_spec["euk_fine_indices"]],
         )
 
-        # 4d. Build Combined Feature Matrix & Gate Inputs
+        # 4. Build Gate Inputs (Dynamically matching config.json)
         gate_marker_dim = int(fold_config.get("gate_marker_dim", 0))
         if gate_marker_dim > 0:
             n_genes_array = features_df_arch.select("n_genes").to_numpy()
@@ -384,16 +476,27 @@ def _run(args: Any) -> None:
             fold_features = xgb_probs
 
         raw_feature_dim = int(fold_config.get("raw_feature_dim", 0))
-        if raw_feature_dim == (len(arch_cols_no_frag) + len(xgb1_mf_df.columns)):
-            raw_gate_features = pl.concat([xgb_arch_df, xgb1_mf_df], how="horizontal").to_numpy()
+        
+        # Enforce strict 13-feature requirement
+        if raw_feature_dim == 13:
+            raw_gate_features = pl.concat(
+                [features_df_arch.select(["fragment_size"]), x_all_df.select(arch_cols_no_frag)], 
+                how="horizontal"
+            ).to_numpy()
         else:
-            raw_gate_features = xgb_arch_df.to_numpy()
+            raise click.ClickException(
+                f"Unsupported configuration: This script is strictly configured for 13 raw gate features. "
+                f"The loaded model config specifies {raw_feature_dim}."
+            )
+            
+        raw_gate_features = np.nan_to_num(raw_gate_features, nan=0.0)
 
-        # 4e. Apply Scaler if present
-        scaler_path = xgb_artifacts_dir / "feature_scaler.joblib"
-        if scaler_path.exists():
-            scaler = joblib.load(scaler_path)
-            fold_features = scaler.transform(fold_features)
+        # Final sanity check to ensure the constructed matrix matches the requirement
+        if raw_gate_features.shape[1] != raw_feature_dim:
+            raise click.ClickException(
+                f"Dimension mismatch: Reconstructed raw_feature_dim ({raw_gate_features.shape[1]}) "
+                f"does not match model config ({raw_feature_dim})."
+            )
 
         # 4f. Load Fold Transformer & Predict
         model_artifact_dir = fold_dir / args.checkpoint_subdir
@@ -432,7 +535,7 @@ def _run(args: Any) -> None:
 
         ckpt_path = model_artifact_dir / "classifier_head.pt"
         if not ckpt_path.exists():
-            ckpt_path = fold_dir / "classifier_head.pt"
+            raise FileNotFoundError(f"Classifier checkpoint not found for fold {fold_dir.name}: {ckpt_path}")
         ckpt_state = torch.load(ckpt_path, map_location=device)
         classifier.load_state_dict(ckpt_state, strict=False)
         classifier.eval()
@@ -458,33 +561,63 @@ def _run(args: Any) -> None:
         # Collect Logits
         fold_logits_list = []
         fold_alphas_list = []
+        fold_glm_logits_list = [] if args.verbose else None
+
         with torch.no_grad():
             for batch in tqdm(dataloader, desc=f"      Inference", leave=False):
                 inputs = {k: v.to(device) for k, v in batch.items() if k not in {'accession', 'labels'}}
+                extra_kwargs = {"return_auxiliary_logits": True} if args.verbose else {}
                 if args.fp16 and device.type == 'cuda':
-                    with torch.cuda.amp.autocast():
-                        logits = classifier(**inputs)
+                    with torch.amp.autocast('cuda'):
+                        outputs = classifier(**inputs, **extra_kwargs)
                 else:
-                    logits = classifier(**inputs)
+                    outputs = classifier(**inputs, **extra_kwargs)
+                
+                if args.verbose:
+                    logits = outputs[0]
+                    glm_batch = outputs[1]
+                    fold_glm_logits_list.append(glm_batch.cpu() if glm_batch is not None else None)
+                else:
+                    logits = outputs
+                    
                 fold_logits_list.append(logits.cpu())
                 if hasattr(classifier, '_last_alpha_batch'):
                     alpha = np.atleast_1d(classifier._last_alpha_batch.flatten())
                     fold_alphas_list.append(alpha)
 
         fold_logits = torch.cat(fold_logits_list, dim=0)
+
+        # Store the dynamic gate weights
         fold_alphas = np.round(
             np.concatenate(fold_alphas_list) if fold_alphas_list else np.full(len(chunked_seqs), np.nan),
             4,
         )
+        
         per_fold_basic.append({"fold_name": fold_dir.name, "logits": fold_logits, "alphas": fold_alphas})
 
         if args.verbose:
+            # 1. Pure, uncalibrated XGBoost probabilities
+            fold_xgb_probs = np.round(xgb_probs, 4)
+            
+            # 2. Pure, uncalibrated GLM probabilities
+            if fold_glm_logits_list and all(x is not None for x in fold_glm_logits_list):
+                fold_glm_probs = np.round(F.softmax(torch.cat(fold_glm_logits_list, dim=0), dim=-1).numpy(), 4)
+            else:
+                fold_glm_probs = None
+
+            # 3. Pure, uncalibrated Ensemble probabilities (The raw math output from the gate)
+            fold_raw_ensemble_probs = np.round(torch.softmax(fold_logits, dim=-1).numpy(), 4)
+                
             per_fold_verbose.append({
                 "fold_name": fold_dir.name,
                 "logits": fold_logits,
                 "alphas": fold_alphas,
-                "features": fold_features_dicts
+                "features": fold_features_dicts,
+                "xgb_probs": fold_xgb_probs,
+                "glm_probs": fold_glm_probs,
+                "raw_ensemble_probs": fold_raw_ensemble_probs,
             })
+            
         if accumulated_logits is None:
             accumulated_logits = fold_logits.clone()
         else:
@@ -495,20 +628,24 @@ def _run(args: Any) -> None:
             torch.cuda.empty_cache()
         gc.collect()
 
-    # ── [5/5] Post-Ensemble Vector Calibration & Aggregation ────────────────
-    logger.info("[5/5] Applying length-aware vector calibration & chunk aggregation")
+    # ── [5/5] Post-Ensemble Calibration & Aggregation ────────────────────────
+    logger.info("[5/5] Applying calibration & chunk aggregation")
     avg_logits = accumulated_logits / len(args.fold_dirs_resolved)
     chunk_lengths = [len(s) for s in chunked_seqs]
 
+    # Calibrate the final, native ensemble logits
     calibrated_probs = _apply_calibration(avg_logits, calib_params, chunk_lengths, num_classes)
+    
+    # Populate the "probs" key for the TSV writers
     for fold_data in per_fold_basic:
         fold_data["probs"] = _apply_calibration(fold_data["logits"], calib_params, chunk_lengths, num_classes)
+        
     if args.verbose:
         for fold_data in per_fold_verbose:
             fold_data["probs"] = _apply_calibration(fold_data["logits"], calib_params, chunk_lengths, num_classes)
 
-
     class_cols = [label_mapping.get(i, f"class_{i}") for i in range(num_classes)]
+
     pred_indices = np.argmax(calibrated_probs, axis=1)
     confidences = np.max(calibrated_probs, axis=1)
     predicted_hosts = [label_mapping.get(int(i), f"class_{i}") for i in pred_indices]
@@ -526,11 +663,11 @@ def _run(args: Any) -> None:
         data_dict["eukaryote_score"] = (1.0 - calibrated_probs[:, prok_col_idx]).tolist()
 
     df_chunks = pl.DataFrame(data_dict).sort("accession")
-    df_chunks.write_csv(args.output, separator="\t")
+    df_chunks.write_csv(args.output, separator="\t", null_value="")
 
     if args.aggregate_chunks:
         df_genomes = _aggregate_chunks(df_chunks, class_cols, prok_col_idx, label_mapping)
-        df_genomes.write_csv(args.genome_output, separator="\t")
+        df_genomes.write_csv(args.genome_output, separator="\t", null_value="")
         logger.info(f"Genome-level predictions written to: {args.genome_output}")
 
     fold_rows: List[Dict] = []
@@ -552,11 +689,14 @@ def _run(args: Any) -> None:
             fold_rows.append(row)
     df_folds = pl.DataFrame(fold_rows).sort(["accession", "fold"])
     folds_path = args.output_dir / f"{args.prefix}.folds.tsv"
-    df_folds.write_csv(folds_path, separator="\t")
+    df_folds.write_csv(folds_path, separator="\t", null_value="")
     logger.info(f"Per-fold predictions written to: {folds_path}")
 
     if args.verbose and per_fold_verbose:
         verbose_rows = []
+
+        n_genes_list = features_df_arch.get_column('n_genes').to_list()
+
         for fold_data in per_fold_verbose:
             fold_probs = fold_data["probs"]
             fold_alphas = fold_data["alphas"]
@@ -567,6 +707,7 @@ def _run(args: Any) -> None:
                 row: Dict = {
                     "accession": acc,
                     "fold": fold_data["fold_name"],
+                    "n_genes": n_genes_list[j],
                     "predicted_host": fold_predicted_hosts[j],
                     "confidence": float(fold_confidences[j]),
                     "glm_gate_weight": None if np.isnan(fold_alphas[j]) else float(fold_alphas[j]),
@@ -574,8 +715,18 @@ def _run(args: Any) -> None:
                 for i, col in enumerate(class_cols):
                     row[col] = float(fold_probs[j, i])
 
-                # inject all architecture and marker features 
-                row.update(fold_data["features"][j] )
+                if fold_data.get("xgb_probs") is not None:
+                    for i, col in enumerate(class_cols):
+                        row[f"xgb_{col}"] = float(fold_data["xgb_probs"][j, i])
+                if fold_data.get("glm_probs") is not None:
+                    for i, col in enumerate(class_cols):
+                        row[f"glm_{col}"] = float(fold_data["glm_probs"][j, i])
+                if fold_data.get("raw_ensemble_probs") is not None:
+                    for i, col in enumerate(class_cols):
+                        row[f"uncalibrated_ensemble_{col}"] = float(fold_data["raw_ensemble_probs"][j, i])
+                        
+                # inject all architecture and marker features
+                row.update(fold_data["features"][j])
 
                 verbose_rows.append(row)
 
@@ -584,8 +735,9 @@ def _run(args: Any) -> None:
         df_verbose.write_csv(verbose_path, separator="\t")
         logger.info(f"Verbose per-fold predictions written to: {verbose_path}")
 
+    for line in _HAMSTER_FACE_ART.splitlines():
+        logger.info(line)
     logger.info("Done!")
-
 
 @click.command(context_settings={"help_option_names": ["-h", "--help"]})
 @click.option("--fasta", type=click.Path(path_type=pathlib.Path, exists=True, dir_okay=False), required=True, help="Input FASTA file.")
@@ -596,6 +748,7 @@ def _run(args: Any) -> None:
 @click.option("--chunk-size", type=int, default=10000, show_default=True, help="Chunk length in bp (must match value used with vhamster).")
 @click.option("--overlap", type=int, default=1000, show_default=True, help="Overlap between chunks in bp (must match value used with vhamster).")
 @click.option("--num-workers", type=int, default=4, show_default=True, help="Worker processes for PyRodigal feature extraction.")
+@click.option("--mmseqs-threads", type=int, default=None, help="Threads for protein prediction and MMseqs2 search. Defaults to --num-workers when not set, so on a cluster you can just set --num-workers to your CPU count and both steps scale together.")
 def features_main(
     fasta: pathlib.Path,
     output: pathlib.Path,
@@ -605,6 +758,7 @@ def features_main(
     chunk_size: int,
     overlap: int,
     num_workers: int,
+    mmseqs_threads: Optional[int],
 ) -> None:
     """Extract architectural and geNomad marker features without running the GLM.
 
@@ -665,12 +819,14 @@ def features_main(
         raise click.ClickException(
             f"geNomad metadata file not found: {genomad_metadata}"
         )
-    logger.info("Running MMseqs2 against geNomad marker database")
+    effective_mmseqs_threads = mmseqs_threads if mmseqs_threads is not None else num_workers
+    logger.info(f"Running MMseqs2 against geNomad marker database ({effective_mmseqs_threads} threads)")
     seq_dict = dict(zip(chunked_accs, chunked_seqs))
     marker_hits, _, annotation_rows = extract_genomad_markers(
         sequences=seq_dict,
         genomad_db=genomad_db,
         genomad_metadata=genomad_metadata,
+        threads=effective_mmseqs_threads,
         return_details=True,
     )
     hits_json = output_dir / f"{prefix}.genomad_hits.json"
@@ -751,15 +907,18 @@ def _preflight_checks(args: Any) -> None:
 @click.option("--num-folds", type=int, default=5, show_default=True, help="Number of folds to use.")
 @click.option("--fold-index", type=int, default=None, help="Use only one fold by index, e.g. 0..4.")
 @click.option("--checkpoint-subdir", default="best_macro_auprc_model", show_default=True, help="Checkpoint subdirectory name.")
-@click.option("--calibration-params", type=str, default=str(_DEFAULT_MODEL_ROOT / "length_aware_vector_scaling_anchors_toplabel_5.json"), show_default=True, help="Path to length-aware vector scaling JSON.")
+@click.option("--calibration-params", type=str, default=str(_DEFAULT_MODEL_ROOT / "proportional_vector_scaling_scalar_nll_notclassbalanced_posthoc_fungi_nolength.json"), show_default=True, help="Path to the vector scaling + post-hoc top-label calibration JSON.")
 @click.option("--chunk-size", type=int, default=10000, show_default=True, help="Chunk length in bp.")
 @click.option("--overlap", type=int, default=1000, show_default=True, help="Overlap between chunks in bp.")
 @click.option("--batch-size", type=int, default=16, show_default=True, help="Inference batch size.")
 @click.option("--fp16", is_flag=True, help="Use FP16 mixed precision.")
 @click.option("--num-workers", type=int, default=4, show_default=True, help="DataLoader workers.")
+@click.option("--mmseqs-threads", type=int, default=4, show_default=True, help="Threads for protein prediction and MMseqs2 search (only used when --precomputed-features is not set).")
 @click.option("--precomputed-features", type=click.Path(path_type=pathlib.Path), default=None, help="Directory containing {prefix}.arch_features.tsv and {prefix}.genomad_hits.json from vhamster-features. Skips MMseqs2 and PyRodigal.")
 @click.option("--aggregate-chunks/--no-aggregate-chunks", default=True, show_default=True, help="Enable/disable genome-level consensus output.")
 @click.option("--verbose", is_flag=True, help="Write per-fold predictions and GLM gate weights to {prefix}.verbose.tsv.")
+@click.option("--mask-features", type=click.Choice(['none', 'density', 'boundary', 'density_plus_boundary']), default='none', help = 'Conditionally mask out specific feature sets with NaNs for ablation testing')
+@click.option("--mask-target", type=click.Choice(['all', 'xgb1_only', 'xgb2_only']), default='all', help='Which XGBoost model to apply the mask to.') # just mask one of the layers of the feature branch 
 def main(
     fasta: pathlib.Path,
     output: pathlib.Path,
@@ -767,7 +926,7 @@ def main(
     force: bool,
     ensemble_dir: pathlib.Path,
     fold_dirs: Tuple[pathlib.Path, ...],
-    genomad_db: pathlib.Path,
+    genomad_db: Optional[pathlib.Path],
     num_folds: int,
     fold_index: Optional[int],
     checkpoint_subdir: str,
@@ -777,13 +936,21 @@ def main(
     batch_size: int,
     fp16: bool,
     num_workers: int,
+    mmseqs_threads: int,
     precomputed_features: Optional[pathlib.Path],
+    mask_features: str,
     aggregate_chunks: bool,
+    mask_target: str,
     verbose: bool,
 ) -> None:
     output_dir = output
     output_dir.mkdir(parents=True, exist_ok=True)
     log_path = _configure_logging(output_dir, prefix)
+
+    # Intercept the static default and reroute it to the dynamic ensemble_dir
+    default_calib_name = "proportional_vector_scaling_scalar_nll_notclassbalanced_posthoc_fungi_nolength.json"
+    if calibration_params == str(_DEFAULT_MODEL_ROOT / default_calib_name):
+        calibration_params = str(ensemble_dir / default_calib_name)
 
     # Locate geNomad database (only needed when not using precomputed features)
     if genomad_db is None:
@@ -794,7 +961,7 @@ def main(
             f"geNomad database not found at {genomad_db}. "
             "Run 'vhamster-install-models' to download it, or provide --genomad-db."
         )
-
+    
     args = SimpleNamespace(
         fasta=fasta,
         output_dir=output_dir,
@@ -813,9 +980,12 @@ def main(
         batch_size=batch_size,
         fp16=fp16,
         num_workers=num_workers,
+        mmseqs_threads=mmseqs_threads,
         precomputed_features=precomputed_features,
         aggregate_chunks=aggregate_chunks,
         genome_output=output_dir / f"{prefix}.genomes.tsv",
+        mask_features=mask_features,
+        mask_target=mask_target,
         verbose=verbose,
     )
 
@@ -838,13 +1008,6 @@ def main(
             )
         args.fold_dirs_resolved = args.fold_dirs_resolved[: args.num_folds]
     args.num_folds = len(args.fold_dirs_resolved)
-
-    # Ensure calibration_params points to ensemble_dir if default site-packages path doesn't exist
-    calib_path = pathlib.Path(calibration_params)
-    if not calib_path.exists():
-        alt_calib = ensemble_dir / "length_aware_vector_scaling_anchors_toplabel_5.json"
-        if alt_calib.exists():
-            calibration_params = str(alt_calib)
 
     logger.info(f"Logging to: {log_path}")
     _preflight_checks(args)
