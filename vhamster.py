@@ -450,32 +450,27 @@ def _run(args: Any) -> None:
             fold_features = xgb_probs
 
         raw_feature_dim = int(fold_config.get("raw_feature_dim", 0))
-        n_arch = len(arch_cols_no_frag)
-        n_arch_plus_markers = n_arch + len(xgb1_mf_df.columns)
         
-        # Support both current inference (12/18) and your data_3.py training (13/19)
+        # Enforce strict 13-feature requirement
         if raw_feature_dim == 13:
-            raw_gate_features = pl.concat([features_df_arch.select(["fragment_size"]), x_all_df.select(arch_cols_no_frag)], how="horizontal").to_numpy()
-        elif raw_feature_dim == 19:
-            raw_gate_features = pl.concat([features_df_arch.select(["fragment_size"]), x_all_df.select(arch_cols_no_frag), x_all_df.select(xgb1_mf_df.columns)], how="horizontal").to_numpy()
-        elif raw_feature_dim == n_arch_plus_markers:
-            raw_gate_features = x_all_df.select(arch_cols_no_frag + list(xgb1_mf_df.columns)).to_numpy()
+            raw_gate_features = pl.concat(
+                [features_df_arch.select(["fragment_size"]), x_all_df.select(arch_cols_no_frag)], 
+                how="horizontal"
+            ).to_numpy()
         else:
-            raw_gate_features = x_all_df.select(arch_cols_no_frag).to_numpy()
+            raise click.ClickException(
+                f"Unsupported configuration: This script is strictly configured for 13 raw gate features. "
+                f"The loaded model config specifies {raw_feature_dim}."
+            )
             
         raw_gate_features = np.nan_to_num(raw_gate_features, nan=0.0)
 
+        # Final sanity check to ensure the constructed matrix matches the requirement
         if raw_gate_features.shape[1] != raw_feature_dim:
             raise click.ClickException(
                 f"Dimension mismatch: Reconstructed raw_feature_dim ({raw_gate_features.shape[1]}) "
                 f"does not match model config ({raw_feature_dim})."
             )
-        
-        # 4e. Apply Scaler if present
-        scaler_path = xgb_artifacts_dir / "feature_scaler.joblib"
-        if scaler_path.exists():
-            scaler = joblib.load(scaler_path)
-            fold_features = scaler.transform(fold_features)
 
         # 4f. Load Fold Transformer & Predict
         model_artifact_dir = fold_dir / args.checkpoint_subdir
@@ -541,34 +536,7 @@ def _run(args: Any) -> None:
         fold_logits_list = []
         fold_alphas_list = []
         fold_glm_logits_list = [] if args.verbose else None
-        fold_xgb_logprobs_list = [] if args.verbose else None
-        with torch.no_grad():
-            for batch in tqdm(dataloader, desc=f"      Inference", leave=False):
-                inputs = {k: v.to(device) for k, v in batch.items() if k not in {'accession', 'labels'}}
-                extra_kwargs = {"return_auxiliary_logits": True} if args.verbose else {}
-                if args.fp16 and device.type == 'cuda':
-                    with torch.amp.autocast('cuda'):
-                        outputs = classifier(**inputs, **extra_kwargs)
-                else:
-                    outputs = classifier(**inputs, **extra_kwargs)
-                if args.verbose:
-                    logits = outputs[0]
-                    glm_batch = outputs[1]
-                    xgb_batch = outputs[2]
-                    fold_glm_logits_list.append(glm_batch.cpu() if glm_batch is not None else None)
-                    fold_xgb_logprobs_list.append(xgb_batch.cpu() if xgb_batch is not None else None)
-                else:
-                    logits = outputs
-                fold_logits_list.append(logits.cpu())
-                if hasattr(classifier, '_last_alpha_batch'):
-                    alpha = np.atleast_1d(classifier._last_alpha_batch.flatten())
-                    fold_alphas_list.append(alpha)
 
-        # Collect Logits
-        fold_logits_list = []
-        fold_alphas_list = []
-        fold_glm_logits_list = [] if args.verbose else None
-        fold_xgb_logprobs_list = [] if args.verbose else None
         with torch.no_grad():
             for batch in tqdm(dataloader, desc=f"      Inference", leave=False):
                 inputs = {k: v.to(device) for k, v in batch.items() if k not in {'accession', 'labels'}}
@@ -578,14 +546,14 @@ def _run(args: Any) -> None:
                         outputs = classifier(**inputs, **extra_kwargs)
                 else:
                     outputs = classifier(**inputs, **extra_kwargs)
+                
                 if args.verbose:
                     logits = outputs[0]
                     glm_batch = outputs[1]
-                    xgb_batch = outputs[2]
                     fold_glm_logits_list.append(glm_batch.cpu() if glm_batch is not None else None)
-                    fold_xgb_logprobs_list.append(xgb_batch.cpu() if xgb_batch is not None else None)
                 else:
                     logits = outputs
+                    
                 fold_logits_list.append(logits.cpu())
                 if hasattr(classifier, '_last_alpha_batch'):
                     alpha = np.atleast_1d(classifier._last_alpha_batch.flatten())
@@ -602,7 +570,7 @@ def _run(args: Any) -> None:
         per_fold_basic.append({"fold_name": fold_dir.name, "logits": fold_logits, "alphas": fold_alphas})
 
         if args.verbose:
-            # 1. Pure, uncalibrated XGBoost probabilities (Identical to predict_xgb_only.py)
+            # 1. Pure, uncalibrated XGBoost probabilities
             fold_xgb_probs = np.round(xgb_probs, 4)
             
             # 2. Pure, uncalibrated GLM probabilities
@@ -610,6 +578,9 @@ def _run(args: Any) -> None:
                 fold_glm_probs = np.round(F.softmax(torch.cat(fold_glm_logits_list, dim=0), dim=-1).numpy(), 4)
             else:
                 fold_glm_probs = None
+
+            # 3. Pure, uncalibrated Ensemble probabilities (The raw math output from the gate)
+            fold_raw_ensemble_probs = np.round(torch.softmax(fold_logits, dim=-1).numpy(), 4)
                 
             per_fold_verbose.append({
                 "fold_name": fold_dir.name,
@@ -618,6 +589,7 @@ def _run(args: Any) -> None:
                 "features": fold_features_dicts,
                 "xgb_probs": fold_xgb_probs,
                 "glm_probs": fold_glm_probs,
+                "raw_ensemble_probs": fold_raw_ensemble_probs,
             })
             
         if accumulated_logits is None:
@@ -723,6 +695,10 @@ def _run(args: Any) -> None:
                 if fold_data.get("glm_probs") is not None:
                     for i, col in enumerate(class_cols):
                         row[f"glm_{col}"] = float(fold_data["glm_probs"][j, i])
+                if fold_data.get("raw_ensemble_probs") is not None:
+                    for i, col in enumerate(class_cols):
+                        row[f"uncalibrated_ensemble_{col}"] = float(fold_data["raw_ensemble_probs"][j, i])
+                        
                 # inject all architecture and marker features
                 row.update(fold_data["features"][j])
 
