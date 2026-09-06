@@ -367,6 +367,8 @@ def _run(args: Any) -> None:
             genomad_metadata=genomad_metadata,
             threads=mmseqs_threads,
             return_details=True,
+            evalue=args.evalue,
+            min_coverage=args.min_coverage,
         )
         genomad_marker_dict = marker_hits
 
@@ -749,6 +751,8 @@ def _run(args: Any) -> None:
 @click.option("--overlap", type=int, default=1000, show_default=True, help="Overlap between chunks in bp (must match value used with vhamster).")
 @click.option("--num-workers", type=int, default=4, show_default=True, help="Worker processes for PyRodigal feature extraction.")
 @click.option("--mmseqs-threads", type=int, default=None, help="Threads for protein prediction and MMseqs2 search. Defaults to --num-workers when not set, so on a cluster you can just set --num-workers to your CPU count and both steps scale together.")
+@click.option("--evalue", type=float, default=1e-3, show_default=True, help="E-value threshold for MMseqs2 marker hits.")
+@click.option("--min-coverage", type=float, default=0.0, show_default=True, help="Minimum bidirectional coverage threshold (0.0 to 1.0).")
 def features_main(
     fasta: pathlib.Path,
     output: pathlib.Path,
@@ -987,6 +991,8 @@ def main(
         mask_features=mask_features,
         mask_target=mask_target,
         verbose=verbose,
+        evalue=evalue,
+        min_coverage=min_coverage,
     )
 
     args.fold_dirs_resolved = _discover_fold_dirs(args)
