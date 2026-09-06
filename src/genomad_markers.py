@@ -400,6 +400,7 @@ def extract_genomad_markers(
             threads=threads,
             min_seq_id=min_seq_id,
             evalue=evalue,
+            min_coverage=min_coverage,
         )
 
         marker_hits, annotation_rows = parse_mmseqs_results(
@@ -475,6 +476,7 @@ def extract_genomad_markers_from_fasta(
     threads: int = 4,
     min_seq_id: float = 0.0,
     evalue: float = 1e-3,
+    min_coverage: float = 0.0
 ) -> Dict[str, Dict[str, float]]:
     """
     Run the full pipeline starting from a FASTA file and save results to a
@@ -495,6 +497,7 @@ def extract_genomad_markers_from_fasta(
         threads=threads,
         min_seq_id=min_seq_id,
         evalue=evalue,
+        min_coverage=min_coverage,
         return_details=True,
     )
 
