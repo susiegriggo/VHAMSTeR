@@ -270,8 +270,9 @@ def _aggregate_chunks(
     )
     df = chunk_df.with_columns(genome_col)
 
+    # --- FIX: Use chunk_weight for math, not the reporting confidence ---
     agg_exprs = [
-        ((pl.col(c) * pl.col("confidence")).sum() / pl.col("confidence").sum()).alias(c)
+        ((pl.col(c) * pl.col("chunk_weight")).sum() / pl.col("chunk_weight").sum()).alias(c)
         for c in class_cols
     ]
     genome_df = df.group_by("genome").agg(agg_exprs).sort("genome")
@@ -284,7 +285,6 @@ def _aggregate_chunks(
     if prok_col_idx is not None:
         prok_scores = prob_arr[:, prok_col_idx]
         euk_scores = 1.0 - prok_scores
-        # Conflict: Eukaryote domain wins, but Prokaryote was top single class
         conflict_mask = (euk_scores > prok_scores) & (pred_indices == prok_col_idx)
     else:
         conflict_mask = np.zeros(len(prob_arr), dtype=bool)
@@ -317,7 +317,6 @@ def _aggregate_chunks(
     lead_cols = ["genome", "predicted_domain", "domain_confidence", "predicted_host", "confidence"]
     existing_lead = [c for c in lead_cols if c in genome_df.columns]
     
-    # Selecting only existing_lead drops the individual class columns
     return genome_df.select(existing_lead)
 
 def _chunk_sequences(seqs: List[str], accessions: List[str], chunk_size: int, overlap: int) -> Tuple[List[str], List[str]]:
@@ -752,10 +751,14 @@ def _run(args: Any) -> None:
         weighted_probs = all_fold_probs * norm_weights[:, :, np.newaxis]
         calibrated_probs = np.round(weighted_probs.sum(axis=0), 4)
 
+    
     class_cols = [label_mapping.get(i, f"class_{i}") for i in range(num_classes)]
 
     pred_indices = np.argmax(calibrated_probs, axis=1)
     confidences_arr = np.max(calibrated_probs, axis=1)
+    
+    # --- FIX: Save the true mathematical weights before overwriting with NaN ---
+    chunk_weights = confidences_arr.copy()
 
     prok_col_idx = next((int(i) for i, n in label_mapping.items() if "prokaryote" in n.lower()), None)
     if prok_col_idx is not None:
@@ -775,6 +778,7 @@ def _run(args: Any) -> None:
         "accession": chunked_accs,
         "predicted_host": predicted_hosts_arr.tolist(),
         "confidence": confidences_arr.tolist(),
+        "chunk_weight": chunk_weights.tolist(),  # <--- Pass clean weights to df
         **{col: calibrated_probs[:, i].tolist() for i, col in enumerate(class_cols)},
     }
 
@@ -789,13 +793,16 @@ def _run(args: Any) -> None:
         data_dict["domain_confidence"] = np.round(domain_confidences, 4).tolist()
 
     df_chunks = pl.DataFrame(data_dict).sort("accession")
-    df_chunks.write_csv(args.output, separator="\t", null_value="")
+    
+    # Write chunks to file but drop the internal chunk_weight column so the TSV stays clean
+    df_chunks.drop("chunk_weight").write_csv(args.output, separator="\t", null_value="")
 
     if args.aggregate_chunks:
         df_genomes = _aggregate_chunks(df_chunks, class_cols, prok_col_idx, label_mapping)
         df_genomes.write_csv(args.genome_output, separator="\t", null_value="")
         logger.info(f"Genome-level predictions written to: {args.genome_output}")
 
+        
     fold_rows: List[Dict] = []
     for fold_data in per_fold_basic:
         fold_probs = fold_data["probs"]
