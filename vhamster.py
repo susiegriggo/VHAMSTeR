@@ -256,7 +256,6 @@ def _select_xgb_features(df: pl.DataFrame, feature_names: Optional[List[str]], m
         )
     return df.select(feature_names).to_numpy().astype(np.float32)
 
-
 def _aggregate_chunks(
     chunk_df: pl.DataFrame,
     class_cols: List[str],
@@ -292,11 +291,22 @@ def _aggregate_chunks(
         genome_df = genome_df.with_columns([
             pl.col(prok_col_name).alias("prokaryote_score"),
             (pl.lit(1.0) - pl.col(prok_col_name)).alias("eukaryote_score"),
+            pl.when(pl.col(prok_col_name) >= 0.5)
+              .then(pl.lit("Prokaryote"))
+              .otherwise(pl.lit("Eukaryote"))
+              .alias("predicted_domain"),
+            pl.when(pl.col(prok_col_name) >= 0.5)
+              .then(pl.col(prok_col_name))
+              .otherwise(1.0 - pl.col(prok_col_name))
+              .round(4)
+              .alias("domain_confidence"),
         ])
 
-    lead_cols = ["genome", "predicted_host", "confidence"]
-    return genome_df.select(lead_cols)
-
+    lead_cols = ["genome", "predicted_domain", "domain_confidence", "predicted_host", "confidence"]
+    existing_lead = [c for c in lead_cols if c in genome_df.columns]
+    
+    # By only selecting existing_lead, all individual class probabilities are dropped
+    return genome_df.select(existing_lead)
 
 def _chunk_sequences(seqs: List[str], accessions: List[str], chunk_size: int, overlap: int) -> Tuple[List[str], List[str]]:
     chunked_seqs, chunked_accs = [], []
@@ -746,8 +756,17 @@ def _run(args: Any) -> None:
 
     prok_col_idx = next((int(i) for i, n in label_mapping.items() if "prokaryote" in n.lower()), None)
     if prok_col_idx is not None:
-        data_dict["prokaryote_score"] = calibrated_probs[:, prok_col_idx].tolist()
-        data_dict["eukaryote_score"] = (1.0 - calibrated_probs[:, prok_col_idx]).tolist()
+        prok_scores = calibrated_probs[:, prok_col_idx]
+        euk_scores = 1.0 - prok_scores
+        
+        data_dict["prokaryote_score"] = np.round(prok_scores, 4).tolist()
+        data_dict["eukaryote_score"] = np.round(euk_scores, 4).tolist()
+        
+        predicted_domains = ["Prokaryote" if p >= 0.5 else "Eukaryote" for p in prok_scores]
+        domain_confidences = [p if p >= 0.5 else (1.0 - p) for p in prok_scores]
+        
+        data_dict["predicted_domain"] = predicted_domains
+        data_dict["domain_confidence"] = np.round(domain_confidences, 4).tolist()
 
     df_chunks = pl.DataFrame(data_dict).sort("accession")
     df_chunks.write_csv(args.output, separator="\t", null_value="")
