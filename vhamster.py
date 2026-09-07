@@ -278,19 +278,31 @@ def _aggregate_chunks(
 
     prob_arr = genome_df.select(class_cols).to_numpy()
     pred_indices = np.argmax(prob_arr, axis=1)
-    confidences = np.max(prob_arr, axis=1)
-    predicted_hosts = [label_mapping.get(int(i), f"class_{i}") for i in pred_indices]
+    confidences_arr = np.max(prob_arr, axis=1)
+
+    # --- Conflict Resolution for Split Votes ---
+    if prok_col_idx is not None:
+        prok_scores = prob_arr[:, prok_col_idx]
+        euk_scores = 1.0 - prok_scores
+        # Conflict: Eukaryote domain wins, but Prokaryote was top single class
+        conflict_mask = (euk_scores > prok_scores) & (pred_indices == prok_col_idx)
+    else:
+        conflict_mask = np.zeros(len(prob_arr), dtype=bool)
+
+    predicted_hosts_arr = np.array([label_mapping.get(int(i), f"class_{i}") for i in pred_indices], dtype=object)
+
+    if np.any(conflict_mask):
+        predicted_hosts_arr[conflict_mask] = "Unassigned"
+        confidences_arr[conflict_mask] = np.nan
 
     genome_df = genome_df.with_columns([
-        pl.Series("predicted_host", predicted_hosts),
-        pl.Series("confidence", np.round(confidences, 4)),
+        pl.Series("predicted_host", predicted_hosts_arr),
+        pl.Series("confidence", np.round(confidences_arr, 4)),
     ])
 
     if prok_col_idx is not None:
         prok_col_name = class_cols[prok_col_idx]
         genome_df = genome_df.with_columns([
-            pl.col(prok_col_name).alias("prokaryote_score"),
-            (pl.lit(1.0) - pl.col(prok_col_name)).alias("eukaryote_score"),
             pl.when(pl.col(prok_col_name) >= 0.5)
               .then(pl.lit("Prokaryote"))
               .otherwise(pl.lit("Eukaryote"))
@@ -305,7 +317,7 @@ def _aggregate_chunks(
     lead_cols = ["genome", "predicted_domain", "domain_confidence", "predicted_host", "confidence"]
     existing_lead = [c for c in lead_cols if c in genome_df.columns]
     
-    # By only selecting existing_lead, all individual class probabilities are dropped
+    # Selecting only existing_lead drops the individual class columns
     return genome_df.select(existing_lead)
 
 def _chunk_sequences(seqs: List[str], accessions: List[str], chunk_size: int, overlap: int) -> Tuple[List[str], List[str]]:
@@ -740,25 +752,33 @@ def _run(args: Any) -> None:
         weighted_probs = all_fold_probs * norm_weights[:, :, np.newaxis]
         calibrated_probs = np.round(weighted_probs.sum(axis=0), 4)
 
-    # (Keep the rest of the script exactly as it is below this point)
     class_cols = [label_mapping.get(i, f"class_{i}") for i in range(num_classes)]
 
     pred_indices = np.argmax(calibrated_probs, axis=1)
-    confidences = np.max(calibrated_probs, axis=1)
-    predicted_hosts = [label_mapping.get(int(i), f"class_{i}") for i in pred_indices]
-
-    data_dict: Dict = {
-        "accession": chunked_accs,
-        "predicted_host": predicted_hosts,
-        "confidence": confidences.tolist(),
-        **{col: calibrated_probs[:, i].tolist() for i, col in enumerate(class_cols)},
-    }
+    confidences_arr = np.max(calibrated_probs, axis=1)
 
     prok_col_idx = next((int(i) for i, n in label_mapping.items() if "prokaryote" in n.lower()), None)
     if prok_col_idx is not None:
         prok_scores = calibrated_probs[:, prok_col_idx]
         euk_scores = 1.0 - prok_scores
-        
+        conflict_mask = (euk_scores > prok_scores) & (pred_indices == prok_col_idx)
+    else:
+        conflict_mask = np.zeros(len(calibrated_probs), dtype=bool)
+
+    predicted_hosts_arr = np.array([label_mapping.get(int(i), f"class_{i}") for i in pred_indices], dtype=object)
+
+    if np.any(conflict_mask):
+        predicted_hosts_arr[conflict_mask] = "Unassigned"
+        confidences_arr[conflict_mask] = np.nan
+
+    data_dict: Dict = {
+        "accession": chunked_accs,
+        "predicted_host": predicted_hosts_arr.tolist(),
+        "confidence": confidences_arr.tolist(),
+        **{col: calibrated_probs[:, i].tolist() for i, col in enumerate(class_cols)},
+    }
+
+    if prok_col_idx is not None:
         data_dict["prokaryote_score"] = np.round(prok_scores, 4).tolist()
         data_dict["eukaryote_score"] = np.round(euk_scores, 4).tolist()
         
