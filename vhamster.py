@@ -12,6 +12,7 @@ import json
 import multiprocessing
 import pathlib
 import pickle
+from torch.utils.data import Sampler
 import re
 import shutil
 import sys
@@ -82,6 +83,48 @@ _HAMSTER_FACE_ART = r"""
                                                                                                                                                                                 
 """.strip("\n")
 
+
+
+class DynamicLengthBatchSampler(Sampler):
+    """
+    Groups sequences by length. Cuts batches early if length variance 
+    exceeds `max_pad_tolerance` to prevent transformer padding artifacts.
+    """
+    def __init__(self, lengths: List[int], batch_size: int, max_pad_tolerance: int = 500):
+        self.lengths = lengths
+        self.batch_size = batch_size
+        self.max_pad_tolerance = max_pad_tolerance
+        
+        # Sort sequence indices by length
+        self.sorted_indices = np.argsort(lengths).tolist()
+        
+        self.batches = []
+        current_batch = []
+        current_min_len = 0
+        
+        for idx in self.sorted_indices:
+            seq_len = self.lengths[idx]
+            
+            if not current_batch:
+                current_batch.append(idx)
+                current_min_len = seq_len
+            else:
+                # If the batch is full, or the padding penalty is too high, cut the batch
+                if len(current_batch) >= self.batch_size or (seq_len - current_min_len) > self.max_pad_tolerance:
+                    self.batches.append(current_batch)
+                    current_batch = [idx]
+                    current_min_len = seq_len
+                else:
+                    current_batch.append(idx)
+                    
+        if current_batch:
+            self.batches.append(current_batch)
+
+    def __iter__(self):
+        return iter(self.batches)
+
+    def __len__(self):
+        return len(self.batches)
 
 def _default_model_root() -> pathlib.Path:
     purelib = sysconfig.get_path("purelib")
@@ -543,6 +586,7 @@ def _run(args: Any) -> None:
         classifier.eval()
 
         # Build DataLoader
+        # Build DataLoader
         dataset = GenomeDataset(
             sequences=chunked_seqs,
             labels=[0] * len(chunked_seqs),
@@ -554,10 +598,21 @@ def _run(args: Any) -> None:
             token_pooling=fold_config.get("pooling", "mean"),
             raw_features=raw_gate_features.tolist(),
         )
+        
+        # Calculate lengths and create the dynamic batch sampler
+        seq_lengths = [len(seq) for seq in chunked_seqs]
+        dynamic_sampler = DynamicLengthBatchSampler(
+            lengths=seq_lengths, 
+            batch_size=args.batch_size, 
+            max_pad_tolerance=200  # Will not allow >200bp padding differences in a single batch
+        )
+
         dataloader = DataLoader(
-            dataset, batch_size=args.batch_size, shuffle=False,
+            dataset, 
+            batch_sampler=dynamic_sampler, 
             collate_fn=make_collate_fn(tokenizer, model_type, max_length),
-            num_workers=args.num_workers, pin_memory=(device.type == "cuda")
+            num_workers=args.num_workers, 
+            pin_memory=(device.type == "cuda")
         )
 
         # Collect Logits
@@ -630,15 +685,11 @@ def _run(args: Any) -> None:
             torch.cuda.empty_cache()
         gc.collect()
 
-    # ── [5/5] Post-Ensemble Calibration & Aggregation ────────────────────────
-    logger.info("[5/5] Applying calibration & chunk aggregation")
-    avg_logits = accumulated_logits / len(args.fold_dirs_resolved)
+   # ── [5/5] Post-Ensemble Calibration & Aggregation ────────────────────────
+    logger.info(f"[5/5] Applying calibration & chunk aggregation (Mode: {args.aggregation_mode})")
     chunk_lengths = [len(s) for s in chunked_seqs]
 
-    # Calibrate the final, native ensemble logits
-    calibrated_probs = _apply_calibration(avg_logits, calib_params, chunk_lengths, num_classes)
-    
-    # Populate the "probs" key for the TSV writers
+    # 1. Pre-calculate individual calibrated probabilities for ALL folds
     for fold_data in per_fold_basic:
         fold_data["probs"] = _apply_calibration(fold_data["logits"], calib_params, chunk_lengths, num_classes)
         
@@ -646,6 +697,40 @@ def _run(args: Any) -> None:
         for fold_data in per_fold_verbose:
             fold_data["probs"] = _apply_calibration(fold_data["logits"], calib_params, chunk_lengths, num_classes)
 
+    # 2. Aggregate according to the selected mode
+    if args.aggregation_mode == "logit":
+        # Standard: average the raw logits, then calibrate the result
+        avg_logits = accumulated_logits / len(args.fold_dirs_resolved)
+        calibrated_probs = _apply_calibration(avg_logits, calib_params, chunk_lengths, num_classes)
+
+    elif args.aggregation_mode == "probability":
+        # Average the post-calibration probabilities
+        accumulated_probs = np.zeros((len(chunked_seqs), num_classes), dtype=np.float32)
+        for fold_data in per_fold_basic:
+            accumulated_probs += fold_data["probs"]
+        calibrated_probs = accumulated_probs / len(args.fold_dirs_resolved)
+        calibrated_probs = np.round(calibrated_probs, 4)
+
+    elif args.aggregation_mode == "entropy":
+        # Stack all fold probabilities: shape (n_folds, n_chunks, n_classes)
+        all_fold_probs = np.stack([fd["probs"] for fd in per_fold_basic], axis=0)
+        
+        # Compute Shannon entropy per chunk per fold: H = -sum(P * log(P))
+        eps = 1e-9
+        H = -np.sum(all_fold_probs * np.log(all_fold_probs + eps), axis=-1)
+        
+        # Calculate inverse entropy weights (+1e-4 prevents division by zero for max confidence)
+        weights = 1.0 / (H + 1e-4)
+        
+        # Normalize weights so they sum to 1 across the folds
+        weights_sum = weights.sum(axis=0, keepdims=True)
+        norm_weights = weights / weights_sum  # shape (n_folds, n_chunks)
+        
+        # Apply weights via broadcasting and sum across the fold axis
+        weighted_probs = all_fold_probs * norm_weights[:, :, np.newaxis]
+        calibrated_probs = np.round(weighted_probs.sum(axis=0), 4)
+
+    # (Keep the rest of the script exactly as it is below this point)
     class_cols = [label_mapping.get(i, f"class_{i}") for i in range(num_classes)]
 
     pred_indices = np.argmax(calibrated_probs, axis=1)
@@ -923,6 +1008,7 @@ def _preflight_checks(args: Any) -> None:
 @click.option("--mask-target", type=click.Choice(['all', 'xgb1_only', 'xgb2_only']), default='all', help='Which XGBoost model to apply the mask to.') # just mask one of the layers of the feature branch 
 @click.option("--min-coverage", type=float, default=0.0, show_default=True, help="Minimum bidirectional coverage threshold (0.0 to 1.0).")
 @click.option("--evalue", type=float, default=1e-3, show_default=True, help="E-value threshold for MMseqs2 marker hits.")
+@click.option("--aggregation-mode", type=click.Choice(['logit', 'probability', 'entropy']), default='logit', show_default=True, help="Method used to aggregate fold predictions.")
 
 def main(
     fasta: pathlib.Path,
@@ -947,6 +1033,7 @@ def main(
     aggregate_chunks: bool,
     mask_target: str,
     verbose: bool,
+    aggregation_mode: str,
     evalue: float,
     min_coverage: float,
 ) -> None:
@@ -995,6 +1082,7 @@ def main(
         mask_target=mask_target,
         verbose=verbose,
         evalue=evalue,
+        aggregation_mode=aggregation_mode,
         min_coverage=min_coverage,
     )
 
