@@ -639,6 +639,7 @@ def _run(args: Any) -> None:
         # Collect Logits
         fold_logits_list = []
         fold_alphas_list = []
+        fold_accessions_order = []
         fold_glm_logits_list = [] if args.verbose else None
 
         with torch.no_grad():
@@ -659,17 +660,25 @@ def _run(args: Any) -> None:
                     logits = outputs
                     
                 fold_logits_list.append(logits.cpu())
+                fold_accessions_order.extend(batch['accession'])
+
                 if hasattr(classifier, '_last_alpha_batch'):
                     alpha = np.atleast_1d(classifier._last_alpha_batch.flatten())
                     fold_alphas_list.append(alpha)
 
-        fold_logits = torch.cat(fold_logits_list, dim=0)
+        # re-index glm outputs back to original chunked_accss FASTA order
+        acc_to_idx = {acc: i for i, acc in enumerate(fold_accessions_order)}
+        reorder_indices = [acc_to_idx[acc] for acc in chunked_accs]
 
-        # Store the dynamic gate weights
-        fold_alphas = np.round(
-            np.concatenate(fold_alphas_list) if fold_alphas_list else np.full(len(chunked_seqs), np.nan),
-            4,
-        )
+        fold_logits = torch.cat(fold_logits_list, dim=0)[reorder_indices]
+
+
+        # store the gate weights
+        if fold_alphas_list:
+            fold_alphas_concat = np.concatenate(fold_alphas_list)
+            fold_alphas = np.round(fold_alphas_concat[reorder_indices], 4)
+        else:
+            fold_alphas = np.full(len(chunked_seqs), np.nan)
         
         per_fold_basic.append({"fold_name": fold_dir.name, "logits": fold_logits, "alphas": fold_alphas})
 
@@ -679,7 +688,8 @@ def _run(args: Any) -> None:
             
             # 2. Pure, uncalibrated GLM probabilities
             if fold_glm_logits_list and all(x is not None for x in fold_glm_logits_list):
-                fold_glm_probs = np.round(F.softmax(torch.cat(fold_glm_logits_list, dim=0), dim=-1).numpy(), 4)
+                concat_glm = torch.cat(fold_glm_logits_list, dim=0)[reorder_indices]
+                fold_glm_probs = np.round(F.softmax(concat_glm, dim=-1).numpy(), 4)
             else:
                 fold_glm_probs = None
 
