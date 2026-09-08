@@ -12,6 +12,7 @@ import json
 import multiprocessing
 import pathlib
 import pickle
+from torch.utils.data import Sampler
 import re
 import shutil
 import sys
@@ -82,6 +83,48 @@ _HAMSTER_FACE_ART = r"""
                                                                                                                                                                                 
 """.strip("\n")
 
+
+
+class DynamicLengthBatchSampler(Sampler):
+    """
+    Groups sequences by length. Cuts batches early if length variance 
+    exceeds `max_pad_tolerance` to prevent transformer padding artifacts.
+    """
+    def __init__(self, lengths: List[int], batch_size: int, max_pad_tolerance: int = 500):
+        self.lengths = lengths
+        self.batch_size = batch_size
+        self.max_pad_tolerance = max_pad_tolerance
+        
+        # Sort sequence indices by length
+        self.sorted_indices = np.argsort(lengths).tolist()
+        
+        self.batches = []
+        current_batch = []
+        current_min_len = 0
+        
+        for idx in self.sorted_indices:
+            seq_len = self.lengths[idx]
+            
+            if not current_batch:
+                current_batch.append(idx)
+                current_min_len = seq_len
+            else:
+                # If the batch is full, or the padding penalty is too high, cut the batch
+                if len(current_batch) >= self.batch_size or (seq_len - current_min_len) > self.max_pad_tolerance:
+                    self.batches.append(current_batch)
+                    current_batch = [idx]
+                    current_min_len = seq_len
+                else:
+                    current_batch.append(idx)
+                    
+        if current_batch:
+            self.batches.append(current_batch)
+
+    def __iter__(self):
+        return iter(self.batches)
+
+    def __len__(self):
+        return len(self.batches)
 
 def _default_model_root() -> pathlib.Path:
     purelib = sysconfig.get_path("purelib")
@@ -213,7 +256,6 @@ def _select_xgb_features(df: pl.DataFrame, feature_names: Optional[List[str]], m
         )
     return df.select(feature_names).to_numpy().astype(np.float32)
 
-
 def _aggregate_chunks(
     chunk_df: pl.DataFrame,
     class_cols: List[str],
@@ -228,32 +270,54 @@ def _aggregate_chunks(
     )
     df = chunk_df.with_columns(genome_col)
 
+    # --- FIX: Use chunk_weight for math, not the reporting confidence ---
     agg_exprs = [
-        ((pl.col(c) * pl.col("confidence")).sum() / pl.col("confidence").sum()).alias(c)
+        ((pl.col(c) * pl.col("chunk_weight")).sum() / pl.col("chunk_weight").sum()).alias(c)
         for c in class_cols
     ]
     genome_df = df.group_by("genome").agg(agg_exprs).sort("genome")
 
     prob_arr = genome_df.select(class_cols).to_numpy()
     pred_indices = np.argmax(prob_arr, axis=1)
-    confidences = np.max(prob_arr, axis=1)
-    predicted_hosts = [label_mapping.get(int(i), f"class_{i}") for i in pred_indices]
+    confidences_arr = np.max(prob_arr, axis=1)
+
+    # --- Conflict Resolution for Split Votes ---
+    if prok_col_idx is not None:
+        prok_scores = prob_arr[:, prok_col_idx]
+        euk_scores = 1.0 - prok_scores
+        conflict_mask = (euk_scores > prok_scores) & (pred_indices == prok_col_idx)
+    else:
+        conflict_mask = np.zeros(len(prob_arr), dtype=bool)
+
+    predicted_hosts_arr = np.array([label_mapping.get(int(i), f"class_{i}") for i in pred_indices], dtype=object)
+
+    if np.any(conflict_mask):
+        predicted_hosts_arr[conflict_mask] = "Unassigned"
+        confidences_arr[conflict_mask] = np.nan
 
     genome_df = genome_df.with_columns([
-        pl.Series("predicted_host", predicted_hosts),
-        pl.Series("confidence", np.round(confidences, 4)),
+        pl.Series("predicted_host", predicted_hosts_arr),
+        pl.Series("confidence", np.round(confidences_arr, 4)),
     ])
 
     if prok_col_idx is not None:
         prok_col_name = class_cols[prok_col_idx]
         genome_df = genome_df.with_columns([
-            pl.col(prok_col_name).alias("prokaryote_score"),
-            (pl.lit(1.0) - pl.col(prok_col_name)).alias("eukaryote_score"),
+            pl.when(pl.col(prok_col_name) >= 0.5)
+              .then(pl.lit("Prokaryote"))
+              .otherwise(pl.lit("Eukaryote"))
+              .alias("predicted_domain"),
+            pl.when(pl.col(prok_col_name) >= 0.5)
+              .then(pl.col(prok_col_name))
+              .otherwise(1.0 - pl.col(prok_col_name))
+              .round(4)
+              .alias("domain_confidence"),
         ])
 
-    lead_cols = ["genome", "predicted_host", "confidence"]
-    return genome_df.select(lead_cols)
-
+    lead_cols = ["genome", "predicted_domain", "domain_confidence", "predicted_host", "confidence"]
+    existing_lead = [c for c in lead_cols if c in genome_df.columns]
+    
+    return genome_df.select(existing_lead)
 
 def _chunk_sequences(seqs: List[str], accessions: List[str], chunk_size: int, overlap: int) -> Tuple[List[str], List[str]]:
     chunked_seqs, chunked_accs = [], []
@@ -367,6 +431,8 @@ def _run(args: Any) -> None:
             genomad_metadata=genomad_metadata,
             threads=mmseqs_threads,
             return_details=True,
+            evalue=args.evalue,
+            min_coverage=args.min_coverage,
         )
         genomad_marker_dict = marker_hits
 
@@ -541,6 +607,7 @@ def _run(args: Any) -> None:
         classifier.eval()
 
         # Build DataLoader
+        # Build DataLoader
         dataset = GenomeDataset(
             sequences=chunked_seqs,
             labels=[0] * len(chunked_seqs),
@@ -552,15 +619,27 @@ def _run(args: Any) -> None:
             token_pooling=fold_config.get("pooling", "mean"),
             raw_features=raw_gate_features.tolist(),
         )
+        
+        # Calculate lengths and create the dynamic batch sampler
+        seq_lengths = [len(seq) for seq in chunked_seqs]
+        dynamic_sampler = DynamicLengthBatchSampler(
+            lengths=seq_lengths, 
+            batch_size=args.batch_size, 
+            max_pad_tolerance=200  # Will not allow >200bp padding differences in a single batch
+        )
+
         dataloader = DataLoader(
-            dataset, batch_size=args.batch_size, shuffle=False,
+            dataset, 
+            batch_sampler=dynamic_sampler, 
             collate_fn=make_collate_fn(tokenizer, model_type, max_length),
-            num_workers=args.num_workers, pin_memory=(device.type == "cuda")
+            num_workers=args.num_workers, 
+            pin_memory=(device.type == "cuda")
         )
 
         # Collect Logits
         fold_logits_list = []
         fold_alphas_list = []
+        fold_accessions_order = []
         fold_glm_logits_list = [] if args.verbose else None
 
         with torch.no_grad():
@@ -581,17 +660,25 @@ def _run(args: Any) -> None:
                     logits = outputs
                     
                 fold_logits_list.append(logits.cpu())
+                fold_accessions_order.extend(batch['accession'])
+
                 if hasattr(classifier, '_last_alpha_batch'):
                     alpha = np.atleast_1d(classifier._last_alpha_batch.flatten())
                     fold_alphas_list.append(alpha)
 
-        fold_logits = torch.cat(fold_logits_list, dim=0)
+        # re-index glm outputs back to original chunked_accss FASTA order
+        acc_to_idx = {acc: i for i, acc in enumerate(fold_accessions_order)}
+        reorder_indices = [acc_to_idx[acc] for acc in chunked_accs]
 
-        # Store the dynamic gate weights
-        fold_alphas = np.round(
-            np.concatenate(fold_alphas_list) if fold_alphas_list else np.full(len(chunked_seqs), np.nan),
-            4,
-        )
+        fold_logits = torch.cat(fold_logits_list, dim=0)[reorder_indices]
+
+
+        # store the gate weights
+        if fold_alphas_list:
+            fold_alphas_concat = np.concatenate(fold_alphas_list)
+            fold_alphas = np.round(fold_alphas_concat[reorder_indices], 4)
+        else:
+            fold_alphas = np.full(len(chunked_seqs), np.nan)
         
         per_fold_basic.append({"fold_name": fold_dir.name, "logits": fold_logits, "alphas": fold_alphas})
 
@@ -601,7 +688,8 @@ def _run(args: Any) -> None:
             
             # 2. Pure, uncalibrated GLM probabilities
             if fold_glm_logits_list and all(x is not None for x in fold_glm_logits_list):
-                fold_glm_probs = np.round(F.softmax(torch.cat(fold_glm_logits_list, dim=0), dim=-1).numpy(), 4)
+                concat_glm = torch.cat(fold_glm_logits_list, dim=0)[reorder_indices]
+                fold_glm_probs = np.round(F.softmax(concat_glm, dim=-1).numpy(), 4)
             else:
                 fold_glm_probs = None
 
@@ -628,15 +716,11 @@ def _run(args: Any) -> None:
             torch.cuda.empty_cache()
         gc.collect()
 
-    # ── [5/5] Post-Ensemble Calibration & Aggregation ────────────────────────
-    logger.info("[5/5] Applying calibration & chunk aggregation")
-    avg_logits = accumulated_logits / len(args.fold_dirs_resolved)
+   # ── [5/5] Post-Ensemble Calibration & Aggregation ────────────────────────
+    logger.info(f"[5/5] Applying calibration & chunk aggregation (Mode: {args.aggregation_mode})")
     chunk_lengths = [len(s) for s in chunked_seqs]
 
-    # Calibrate the final, native ensemble logits
-    calibrated_probs = _apply_calibration(avg_logits, calib_params, chunk_lengths, num_classes)
-    
-    # Populate the "probs" key for the TSV writers
+    # 1. Pre-calculate individual calibrated probabilities for ALL folds
     for fold_data in per_fold_basic:
         fold_data["probs"] = _apply_calibration(fold_data["logits"], calib_params, chunk_lengths, num_classes)
         
@@ -644,32 +728,91 @@ def _run(args: Any) -> None:
         for fold_data in per_fold_verbose:
             fold_data["probs"] = _apply_calibration(fold_data["logits"], calib_params, chunk_lengths, num_classes)
 
+    # 2. Aggregate according to the selected mode
+    if args.aggregation_mode == "logit":
+        # Standard: average the raw logits, then calibrate the result
+        avg_logits = accumulated_logits / len(args.fold_dirs_resolved)
+        calibrated_probs = _apply_calibration(avg_logits, calib_params, chunk_lengths, num_classes)
+
+    elif args.aggregation_mode == "probability":
+        # Average the post-calibration probabilities
+        accumulated_probs = np.zeros((len(chunked_seqs), num_classes), dtype=np.float32)
+        for fold_data in per_fold_basic:
+            accumulated_probs += fold_data["probs"]
+        calibrated_probs = accumulated_probs / len(args.fold_dirs_resolved)
+        calibrated_probs = np.round(calibrated_probs, 4)
+
+    elif args.aggregation_mode == "entropy":
+        # Stack all fold probabilities: shape (n_folds, n_chunks, n_classes)
+        all_fold_probs = np.stack([fd["probs"] for fd in per_fold_basic], axis=0)
+        
+        # Compute Shannon entropy per chunk per fold: H = -sum(P * log(P))
+        eps = 1e-9
+        H = -np.sum(all_fold_probs * np.log(all_fold_probs + eps), axis=-1)
+        
+        # Calculate inverse entropy weights (+1e-4 prevents division by zero for max confidence)
+        weights = 1.0 / (H + 1e-4)
+        
+        # Normalize weights so they sum to 1 across the folds
+        weights_sum = weights.sum(axis=0, keepdims=True)
+        norm_weights = weights / weights_sum  # shape (n_folds, n_chunks)
+        
+        # Apply weights via broadcasting and sum across the fold axis
+        weighted_probs = all_fold_probs * norm_weights[:, :, np.newaxis]
+        calibrated_probs = np.round(weighted_probs.sum(axis=0), 4)
+
+    
     class_cols = [label_mapping.get(i, f"class_{i}") for i in range(num_classes)]
 
     pred_indices = np.argmax(calibrated_probs, axis=1)
-    confidences = np.max(calibrated_probs, axis=1)
-    predicted_hosts = [label_mapping.get(int(i), f"class_{i}") for i in pred_indices]
-
-    data_dict: Dict = {
-        "accession": chunked_accs,
-        "predicted_host": predicted_hosts,
-        "confidence": confidences.tolist(),
-        **{col: calibrated_probs[:, i].tolist() for i, col in enumerate(class_cols)},
-    }
+    confidences_arr = np.max(calibrated_probs, axis=1)
+    
+    # --- FIX: Save the true mathematical weights before overwriting with NaN ---
+    chunk_weights = confidences_arr.copy()
 
     prok_col_idx = next((int(i) for i, n in label_mapping.items() if "prokaryote" in n.lower()), None)
     if prok_col_idx is not None:
-        data_dict["prokaryote_score"] = calibrated_probs[:, prok_col_idx].tolist()
-        data_dict["eukaryote_score"] = (1.0 - calibrated_probs[:, prok_col_idx]).tolist()
+        prok_scores = calibrated_probs[:, prok_col_idx]
+        euk_scores = 1.0 - prok_scores
+        conflict_mask = (euk_scores > prok_scores) & (pred_indices == prok_col_idx)
+    else:
+        conflict_mask = np.zeros(len(calibrated_probs), dtype=bool)
+
+    predicted_hosts_arr = np.array([label_mapping.get(int(i), f"class_{i}") for i in pred_indices], dtype=object)
+
+    if np.any(conflict_mask):
+        predicted_hosts_arr[conflict_mask] = "Unassigned"
+        confidences_arr[conflict_mask] = np.nan
+
+    data_dict: Dict = {
+        "accession": chunked_accs,
+        "predicted_host": predicted_hosts_arr.tolist(),
+        "confidence": confidences_arr.tolist(),
+        "chunk_weight": chunk_weights.tolist(),  # <--- Pass clean weights to df
+        **{col: calibrated_probs[:, i].tolist() for i, col in enumerate(class_cols)},
+    }
+
+    if prok_col_idx is not None:
+        data_dict["prokaryote_score"] = np.round(prok_scores, 4).tolist()
+        data_dict["eukaryote_score"] = np.round(euk_scores, 4).tolist()
+        
+        predicted_domains = ["Prokaryote" if p >= 0.5 else "Eukaryote" for p in prok_scores]
+        domain_confidences = [p if p >= 0.5 else (1.0 - p) for p in prok_scores]
+        
+        data_dict["predicted_domain"] = predicted_domains
+        data_dict["domain_confidence"] = np.round(domain_confidences, 4).tolist()
 
     df_chunks = pl.DataFrame(data_dict).sort("accession")
-    df_chunks.write_csv(args.output, separator="\t", null_value="")
+    
+    # Write chunks to file but drop the internal chunk_weight column so the TSV stays clean
+    df_chunks.drop("chunk_weight").write_csv(args.output, separator="\t", null_value="")
 
     if args.aggregate_chunks:
         df_genomes = _aggregate_chunks(df_chunks, class_cols, prok_col_idx, label_mapping)
         df_genomes.write_csv(args.genome_output, separator="\t", null_value="")
         logger.info(f"Genome-level predictions written to: {args.genome_output}")
 
+        
     fold_rows: List[Dict] = []
     for fold_data in per_fold_basic:
         fold_probs = fold_data["probs"]
@@ -919,6 +1062,10 @@ def _preflight_checks(args: Any) -> None:
 @click.option("--verbose", is_flag=True, help="Write per-fold predictions and GLM gate weights to {prefix}.verbose.tsv.")
 @click.option("--mask-features", type=click.Choice(['none', 'density', 'boundary', 'density_plus_boundary']), default='none', help = 'Conditionally mask out specific feature sets with NaNs for ablation testing')
 @click.option("--mask-target", type=click.Choice(['all', 'xgb1_only', 'xgb2_only']), default='all', help='Which XGBoost model to apply the mask to.') # just mask one of the layers of the feature branch 
+@click.option("--min-coverage", type=float, default=0.0, show_default=True, help="Minimum bidirectional coverage threshold (0.0 to 1.0).")
+@click.option("--evalue", type=float, default=1e-3, show_default=True, help="E-value threshold for MMseqs2 marker hits.")
+@click.option("--aggregation-mode", type=click.Choice(['logit', 'probability', 'entropy']), default='logit', show_default=True, help="Method used to aggregate fold predictions.")
+
 def main(
     fasta: pathlib.Path,
     output: pathlib.Path,
@@ -942,6 +1089,9 @@ def main(
     aggregate_chunks: bool,
     mask_target: str,
     verbose: bool,
+    aggregation_mode: str,
+    evalue: float,
+    min_coverage: float,
 ) -> None:
     output_dir = output
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -987,6 +1137,9 @@ def main(
         mask_features=mask_features,
         mask_target=mask_target,
         verbose=verbose,
+        evalue=evalue,
+        aggregation_mode=aggregation_mode,
+        min_coverage=min_coverage,
     )
 
     args.fold_dirs_resolved = _discover_fold_dirs(args)

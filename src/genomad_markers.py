@@ -207,6 +207,7 @@ def run_mmseqs_search(
     threads: int = 4,
     min_seq_id: float = 0.0,
     evalue: float = 1e-3,
+    min_coverage: float = 0.0,
 ) -> None:
     """Run mmseqs easy-search and write results as TSV."""
     format_output = "query,target,evalue,bits,qlen,tlen,qstart,qend,tstart,tend,alnlen"
@@ -220,6 +221,7 @@ def run_mmseqs_search(
         "--threads", str(threads),
         "--min-seq-id", str(min_seq_id),
         "-e", str(evalue),
+        "-c", str(min_coverage),
         "--format-output", format_output,
         "-v", "1",
     ]
@@ -353,6 +355,7 @@ def extract_genomad_markers(
     threads: int = 4,
     min_seq_id: float = 0.0,
     evalue: float = 1e-3,
+    min_coverage: float = 0.0,
     return_details: bool = False,
 ) -> Dict[str, Dict[str, float]] | Tuple[Dict[str, Dict[str, float]], Dict[str, str], List[Dict[str, str]]]:
     """
@@ -397,6 +400,7 @@ def extract_genomad_markers(
             threads=threads,
             min_seq_id=min_seq_id,
             evalue=evalue,
+            min_coverage=min_coverage,
         )
 
         marker_hits, annotation_rows = parse_mmseqs_results(
@@ -472,6 +476,7 @@ def extract_genomad_markers_from_fasta(
     threads: int = 4,
     min_seq_id: float = 0.0,
     evalue: float = 1e-3,
+    min_coverage: float = 0.0
 ) -> Dict[str, Dict[str, float]]:
     """
     Run the full pipeline starting from a FASTA file and save results to a
@@ -492,6 +497,7 @@ def extract_genomad_markers_from_fasta(
         threads=threads,
         min_seq_id=min_seq_id,
         evalue=evalue,
+        min_coverage=min_coverage,
         return_details=True,
     )
 
