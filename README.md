@@ -45,50 +45,42 @@ A geNomad database is required at runtime. `vhamster-install-models` downloads i
 
 ## Installation
 
-### pip (editable install from repo)
+### Conda / Bioconda (Recommended)
+The easiest way to install VHAMSTeR is through Bioconda, as it automatically installs both the Python package and the required `mmseqs2` external dependency.
 
-Clone the repository and install from the repository root:
+```
+conda install -c conda-forge -c bioconda vhamster
+```
 
-```bash
-git clone https://code.jgi.doe.gov/SusieGrigson/vhamster.git
+### PyPI (pip)
+You can install the package directly from PyPI.
+
+Note: mmseqs2 is not a Python package. If you install via pip, you must install mmseqs2 separately (see Dependencies above).
+
+```
+pip install vhamster
+```
+
+### Local / Development Install
+If you need to modify the code, clone the repository and install it in editable mode:
+
+```
+git clone https://github.com/susiegriggo/VHAMSTeR.git
 cd vhamster
 pip install -e .
 ```
 
-This installs all Python dependencies listed in `pyproject.toml` and registers the
-`vhamster` and `vhamster-install-models` shell commands.
-
-> **Note:** `mmseqs2` is not a Python package and must be installed separately (see above).
-
 ### Optional GPU support
+CUDA is only needed if you want to run on GPU. CPU inference is supported and is often fast enough unless you are processing a large amount of data.
 
-CUDA is only needed if you want to run on GPU. CPU inference is supported and is
-often fast enough unless you are processing a large amount of data.
+If you want GPU support, install a PyTorch build that matches your CUDA version. Visit https://pytorch.org/get-started/locally/ to get the right command for your setup. For example:
 
-If you want GPU support, install a PyTorch build that matches your CUDA version.
-Visit https://pytorch.org/get-started/locally/ to get the right command for your
-setup, for example:
-
-```bash
+```
 # CUDA 12.1
-pip install torch --index-url https://download.pytorch.org/whl/cu121
+pip install torch --index-url [https://download.pytorch.org/whl/cu121](https://download.pytorch.org/whl/cu121)
 
 # CPU only
-pip install torch --index-url https://download.pytorch.org/whl/cpu
-```
-
-If you already ran `pip install -e .`, installing the appropriate PyTorch build
-afterward is fine and will replace the default wheel if needed.
-
-### Conda environment (recommended for HPC)
-
-An `environment.yml` is provided that includes `mmseqs2` from `bioconda`. If you
-want GPU support, edit the `pytorch-cuda` version to match your cluster before running:
-
-```bash
-conda env create -f environment.yml
-conda activate vhamster
-pip install -e .
+pip install torch --index-url [https://download.pytorch.org/whl/cpu](https://download.pytorch.org/whl/cpu)
 ```
 
 ## Model installation
