@@ -109,15 +109,30 @@ If that default location is not writable, install to your own directory instead:
 vhamster-install-models -o /path/to/my_vhamster_models
 ```
 
-Reinstall if needed:
+Reinstall everything if needed:
 
 ```bash
 vhamster-install-models -f
 ```
 
+Re-download a single component without touching the others:
+
+```bash
+# geNomad marker database only
+vhamster-install-models --only genomad
+
+# NTv3 base transformer model only
+vhamster-install-models --only ntv3
+
+# VHAMSTeR ensemble weights only
+vhamster-install-models --only vhamster
+```
+
+`--only` can be repeated to combine components, e.g. `--only vhamster --only ntv3`.
+
 The installer places files at:
 - `<install_root>/fold_0/` … `<install_root>/fold_4/` — ensemble model weights
-- `<install_root>/length_aware_vector_scaling_anchors_toplabel_5.json` — calibration parameters
+- `<install_root>/proportional_vector_scaling_scalar_nll_notclassbalanced_posthoc_fungi_nolength.json` — calibration parameters
 - `<install_root>/genomad_db/` — geNomad marker database
 - `<install_root>/base_models/` — NTv3 base transformer model
 
@@ -224,7 +239,7 @@ Use a non-default calibration parameters file:
 vhamster \
   --fasta /path/to/input.fasta \
   --output /path/to/results_dir \
-  --calibration-params /path/to/length_aware_vector_scaling_anchors_toplabel_5.json
+  --calibration-params /path/to/proportional_vector_scaling_scalar_nll_notclassbalanced_posthoc_fungi_nolength.json
 ```
 
 ## Two-stage pipeline (HPC)

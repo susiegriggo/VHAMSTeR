@@ -43,7 +43,7 @@ GENOMAD_FILES = [
 ]
 
 REQUIRED_MODEL_FILES = ["fold_0", "fold_1", "fold_2", "fold_3", "fold_4"]
-REQUIRED_ROOT_FILES = ["length_aware_vector_scaling_anchors_toplabel_5.json"]
+REQUIRED_ROOT_FILES = ["proportional_vector_scaling_scalar_nll_notclassbalanced_posthoc_fungi_nolength.json"]
 DEFAULT_MODEL_DIRNAME = "vhamster_models_v1.4.0"
 
 
@@ -65,16 +65,11 @@ def get_default_model_dir() -> str:
 
 def check_model_installation(model_dir: str) -> bool:
     for file_name in REQUIRED_ROOT_FILES:
-        file_path = os.path.join(model_dir, file_name)
-        if not os.path.isfile(file_path):
-            logger.warning(f"Required file missing: {file_path}")
+        if not os.path.isfile(os.path.join(model_dir, file_name)):
             return False
     for fold_name in REQUIRED_MODEL_FILES:
-        fold_path = os.path.join(model_dir, fold_name)
-        if not os.path.isdir(fold_path):
-            logger.warning(f"Fold directory missing: {fold_path}")
+        if not os.path.isdir(os.path.join(model_dir, fold_name)):
             return False
-    logger.info("All required model files are present")
     return True
 
 
@@ -342,30 +337,58 @@ def install_genomad(model_dir: str, force: bool = False):
     download_genomad_from_zenodo(genomad_db_dir)
 
 
+COMPONENTS = ("vhamster", "genomad", "ntv3")
+
+
 @click.command()
 @click.option("-o", "--outdir", type=click.Path(path_type=str), default=None,
               help="Directory to install models into (default: environment site-packages).")
 @click.option("-f", "--force", is_flag=True, default=False,
               help="Force reinstallation even if models already exist.")
+@click.option("--only", "only", multiple=True,
+              type=click.Choice(COMPONENTS, case_sensitive=False),
+              help=(
+                  "Download only the named component(s). "
+                  "Can be repeated: --only vhamster --only ntv3. "
+                  "Choices: vhamster (ensemble weights), genomad (marker database), "
+                  "ntv3 (base transformer model). "
+                  "Omit to install everything."
+              ))
 @click.option("--skip-base-model", is_flag=True, default=False,
               help="Skip downloading the NTv3 base transformer model. "
                    "Use only if you have already cached it or intend to authenticate later.")
 @click.option("--debug", is_flag=True, default=False,
               help="Enable verbose debug logging.")
-def main(outdir, force, debug, skip_base_model):
+def main(outdir, force, debug, skip_base_model, only):
     """Download and install VHAMSTeR models from HuggingFace and the geNomad
-    marker database from Zenodo."""
+    marker database from Zenodo.
+
+    By default all components are installed. Use --only to re-download a single
+    component without touching the others, e.g.:
+
+    \b
+        vhamster-install-models --only genomad
+        vhamster-install-models --only ntv3
+        vhamster-install-models --only vhamster --only ntv3
+    """
     configure_logging(debug)
 
     model_dir = os.path.abspath(outdir) if outdir else get_default_model_dir()
     logger.info(f"Model installation directory: {model_dir}")
 
-    instantiate_install(model_dir, force)
-    install_genomad(model_dir, force)
+    # Normalise: empty tuple means "all components".
+    install_all = not only
+    selected = set(c.lower() for c in only)
+
+    if install_all or "vhamster" in selected:
+        instantiate_install(model_dir, force)
+
+    if install_all or "genomad" in selected:
+        install_genomad(model_dir, force)
 
     if skip_base_model:
         logger.info("Skipping base transformer model download (--skip-base-model).")
-    else:
+    elif install_all or "ntv3" in selected:
         logger.info("Downloading NTv3 base transformer model for offline use...")
         cache_base_models(model_dir, force)
 

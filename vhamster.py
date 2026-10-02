@@ -1112,7 +1112,7 @@ def _preflight_checks(args: Any) -> None:
 @click.option("--num-folds", type=int, default=5, show_default=True, help="Number of folds to use.")
 @click.option("--fold-index", type=int, default=None, help="Use only one fold by index, e.g. 0..4.")
 @click.option("--checkpoint-subdir", default="best_macro_auprc_model", show_default=True, help="Checkpoint subdirectory name.")
-@click.option("--calibration-params", type=str, default=str(_DEFAULT_MODEL_ROOT / "length_aware_vector_scaling_anchors_toplabel_5.json"), show_default=True, help="Path to the vector scaling + post-hoc top-label calibration JSON.")
+@click.option("--calibration-params", type=str, default=str(_DEFAULT_MODEL_ROOT / "proportional_vector_scaling_scalar_nll_notclassbalanced_posthoc_fungi_nolength.json"), show_default=True, help="Path to the vector scaling + post-hoc top-label calibration JSON.")
 @click.option("--chunk-size", type=int, default=10000, show_default=True, help="Chunk length in bp.")
 @click.option("--overlap", type=int, default=1000, show_default=True, help="Overlap between chunks in bp.")
 @click.option("--batch-size", type=int, default=16, show_default=True, help="Inference batch size.")
@@ -1160,7 +1160,7 @@ def main(
     log_path = _configure_logging(output_dir, prefix)
 
     # Intercept the static default and reroute it to the dynamic ensemble_dir
-    default_calib_name = "length_aware_vector_scaling_anchors_toplabel_5.json"
+    default_calib_name = "proportional_vector_scaling_scalar_nll_notclassbalanced_posthoc_fungi_nolength.json"
     if calibration_params == str(_DEFAULT_MODEL_ROOT / default_calib_name):
         calibration_params = str(ensemble_dir / default_calib_name)
 
