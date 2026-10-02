@@ -95,7 +95,7 @@ vhamster-install-models
 
 During installation you will be asked to:
 
-1. Agree to the [InstaDeepAI licence terms](NTV3_MODEL-LICENSE.md) for the NTv3 base model (non-commercial use only)
+1. Agree to the [InstaDeepAI licence terms](https://huggingface.co/InstaDeepAI/NTv3_650M_pre) for the NTv3 base model (non-commercial use only)
 2. Log in to HuggingFace — a browser tab will open automatically. If you do not yet have a free HuggingFace account, you can create one at [huggingface.co/join](https://huggingface.co/join) before running the command
 
 Once installation is complete, vhamster runs fully offline — no HuggingFace account is needed at runtime.
