@@ -8,6 +8,7 @@ from Zenodo.
 
 import gzip
 import hashlib
+import json
 import os
 import shutil
 import subprocess as sp
@@ -18,7 +19,7 @@ import tempfile
 import urllib.request
 from pathlib import Path
 
-from huggingface_hub import snapshot_download
+from huggingface_hub import snapshot_download, get_token, login, model_info
 from loguru import logger
 import click
 
@@ -43,7 +44,7 @@ GENOMAD_FILES = [
 
 REQUIRED_MODEL_FILES = ["fold_0", "fold_1", "fold_2", "fold_3", "fold_4"]
 REQUIRED_ROOT_FILES = ["proportional_vector_scaling_scalar_nll_notclassbalanced_posthoc_fungi_nolength.json"]
-DEFAULT_MODEL_DIRNAME = "vhamster_models_v1.3.0"
+DEFAULT_MODEL_DIRNAME = "vhamster_models_v1.4.0"
 
 
 def configure_logging(debug: bool = False):
@@ -64,16 +65,11 @@ def get_default_model_dir() -> str:
 
 def check_model_installation(model_dir: str) -> bool:
     for file_name in REQUIRED_ROOT_FILES:
-        file_path = os.path.join(model_dir, file_name)
-        if not os.path.isfile(file_path):
-            logger.warning(f"Required file missing: {file_path}")
+        if not os.path.isfile(os.path.join(model_dir, file_name)):
             return False
     for fold_name in REQUIRED_MODEL_FILES:
-        fold_path = os.path.join(model_dir, fold_name)
-        if not os.path.isdir(fold_path):
-            logger.warning(f"Fold directory missing: {fold_path}")
+        if not os.path.isdir(os.path.join(model_dir, fold_name)):
             return False
-    logger.info("All required model files are present")
     return True
 
 
@@ -112,11 +108,150 @@ def get_models_huggingface(model_dir: str):
     abs_path = os.path.abspath(model_dir)
     logger.info(f"Downloading VHAMSTeR models from HuggingFace ({HF_REPO_ID})")
     try:
-        snapshot_download(repo_id=HF_REPO_ID, repo_type="model", local_dir=abs_path, revision='v1.3.0')
+        snapshot_download(repo_id=HF_REPO_ID, repo_type="model", local_dir=abs_path, revision='v1.4.0')
     except Exception as e:
         logger.error(f"Download failed: {e}")
         sys.exit(f"Coul d not download models from HuggingFace.\n{e}")
     logger.info("Model download complete.")
+
+
+_NTV3_LICENSE_SUMMARY = """
+╔══════════════════════════════════════════════════════════════════════════════╗
+║          InstaDeep Open Model Licence — key terms (NTv3_650M_pre)          ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  • NON-COMMERCIAL USE ONLY.                                                 ║
+║  • You may use, reproduce, and share the model and its outputs solely for   ║
+║    non-commercial purposes.                                                 ║
+║  • You may NOT sublicense, resell, or distribute copies of the model.       ║
+║  • You may NOT use it to train or improve commercial derivative models.     ║
+║  • Full licence text: NTV3_MODEL-LICENSE.md in this repository.             ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+"""
+
+
+def ensure_base_model_auth(model_id: str) -> bool:
+    """Ensure the user is authenticated and has access to a gated HuggingFace model.
+
+    Displays the NTv3 licence summary, asks for agreement, and guides the user
+    through HuggingFace login if they are not already authenticated.  Returns
+    True when the model is accessible, False otherwise.
+    """
+    # Check whether the model is actually gated before asking anything.
+    try:
+        info = model_info(model_id)
+        is_gated = bool(info.gated)
+    except Exception:
+        is_gated = True  # assume gated if we cannot check
+
+    if not is_gated:
+        return True
+
+    # Show licence summary and request agreement.
+    logger.info(_NTV3_LICENSE_SUMMARY)
+    logger.info(
+        f"Downloading '{model_id}' requires agreeing to InstaDeepAI's terms and\n"
+        "a free HuggingFace account.  If you do not already have one, you can\n"
+        "create one for free at https://huggingface.co/join\n"
+        f"and then request access at https://huggingface.co/{model_id}\n"
+    )
+
+    try:
+        # Use /dev/tty directly so that tqdm progress-bar output that may have
+        # been written to stdout/stderr does not consume or disrupt stdin on
+        # cluster login nodes.
+        with open("/dev/tty") as _tty:
+            sys.stdout.write("Do you agree to the NTv3 licence terms above? [yes/no]: ")
+            sys.stdout.flush()
+            answer = _tty.readline().strip().lower()
+    except OSError:
+        try:
+            answer = input("Do you agree to the NTv3 licence terms above? [yes/no]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+
+    if answer not in ("yes", "y"):
+        logger.warning("Licence not accepted — skipping base model download.")
+        return False
+
+    # Check whether a HuggingFace token is already cached.
+    token = get_token()
+    if token:
+        logger.info("HuggingFace credentials already present.")
+        return True
+
+    # No token — offer browser-based login (opens huggingface.co in the browser).
+    logger.info(
+        "No HuggingFace login detected.  Opening your browser to log in.\n"
+        "If you prefer the command line, cancel and run:  huggingface-cli login"
+    )
+    try:
+        login()  # opens a browser tab; falls back to token prompt if no browser
+    except Exception as e:
+        logger.warning(f"Browser login failed ({e}). Run 'huggingface-cli login' manually, then re-run vhamster-install-models")
+        return False
+
+    token = get_token()
+    if not token:
+        logger.warning("Login did not complete. Re-run vhamster-install-models after authenticating.")
+        return False
+
+    logger.info("HuggingFace login successful.")
+    return True
+
+
+def cache_base_models(model_dir: str, force: bool = False) -> bool:
+    """Download and cache the base transformer model(s) required by each fold.
+
+    Reads each fold's config.json to discover the HuggingFace model ID, then
+    stores the full snapshot under <model_dir>/base_models/<org>--<model>/.
+    Returns True if all base models are cached successfully.
+    """
+    base_models_dir = os.path.join(model_dir, "base_models")
+
+    base_model_ids: set = set()
+    for fold_name in REQUIRED_MODEL_FILES:
+        config_path = os.path.join(model_dir, fold_name, "config.json")
+        if not os.path.isfile(config_path):
+            logger.warning(f"config.json not found for {fold_name} — skipping")
+            continue
+        with open(config_path) as f:
+            fold_config = json.load(f)
+        model_id = fold_config.get("model")
+        if model_id:
+            base_model_ids.add(model_id)
+
+    if not base_model_ids:
+        logger.warning("No base model IDs found in fold configs. Skipping base model cache.")
+        return False
+
+    os.makedirs(base_models_dir, exist_ok=True)
+    all_ok = True
+    for model_id in sorted(base_model_ids):
+        local_name = model_id.replace("/", "--")
+        local_dir = os.path.join(base_models_dir, local_name)
+        already_cached = os.path.isdir(local_dir) and os.listdir(local_dir)
+        if already_cached and not force:
+            logger.info(f"Base model already cached: {model_id}")
+            continue
+        if not ensure_base_model_auth(model_id):
+            all_ok = False
+            continue
+        logger.info(f"Downloading base model: {model_id}")
+        try:
+            snapshot_download(repo_id=model_id, repo_type="model", local_dir=local_dir)
+            logger.info(f"Base model cached: {local_dir}")
+        except Exception as e:
+            logger.warning(
+                f"Could not download base model '{model_id}': {e}\n"
+                "  If this model is gated on HuggingFace you must:\n"
+                f"    1. Request access at https://huggingface.co/{model_id}\n"
+                "    2. Run: huggingface-cli login\n"
+                "    3. Re-run: vhamster-install-models\n"
+                "  Users will still be prompted for HuggingFace credentials at runtime until "
+                "the base model is cached here."
+            )
+            all_ok = False
+    return all_ok
 
 
 def download_genomad_from_zenodo(genomad_db_dir: str):
@@ -202,27 +337,75 @@ def install_genomad(model_dir: str, force: bool = False):
     download_genomad_from_zenodo(genomad_db_dir)
 
 
+COMPONENTS = ("vhamster", "genomad", "ntv3")
+
+
 @click.command()
 @click.option("-o", "--outdir", type=click.Path(path_type=str), default=None,
               help="Directory to install models into (default: environment site-packages).")
 @click.option("-f", "--force", is_flag=True, default=False,
               help="Force reinstallation even if models already exist.")
+@click.option("--only", "only", multiple=True,
+              type=click.Choice(COMPONENTS, case_sensitive=False),
+              help=(
+                  "Download only the named component(s). "
+                  "Can be repeated: --only vhamster --only ntv3. "
+                  "Choices: vhamster (ensemble weights), genomad (marker database), "
+                  "ntv3 (base transformer model). "
+                  "Omit to install everything."
+              ))
+@click.option("--skip-base-model", is_flag=True, default=False,
+              help="Skip downloading the NTv3 base transformer model. "
+                   "Use only if you have already cached it or intend to authenticate later.")
 @click.option("--debug", is_flag=True, default=False,
               help="Enable verbose debug logging.")
-def main(outdir, force, debug):
+def main(outdir, force, debug, skip_base_model, only):
     """Download and install VHAMSTeR models from HuggingFace and the geNomad
-    marker database from Zenodo."""
+    marker database from Zenodo.
+
+    By default all components are installed. Use --only to re-download a single
+    component without touching the others, e.g.:
+
+    \b
+        vhamster-install-models --only genomad
+        vhamster-install-models --only ntv3
+        vhamster-install-models --only vhamster --only ntv3
+    """
     configure_logging(debug)
 
     model_dir = os.path.abspath(outdir) if outdir else get_default_model_dir()
     logger.info(f"Model installation directory: {model_dir}")
 
-    instantiate_install(model_dir, force)
-    install_genomad(model_dir, force)
+    # Normalise: empty tuple means "all components".
+    install_all = not only
+    selected = set(c.lower() for c in only)
+
+    if install_all or "vhamster" in selected:
+        instantiate_install(model_dir, force)
+
+    if install_all or "genomad" in selected:
+        install_genomad(model_dir, force)
+
+    if skip_base_model:
+        logger.info("Skipping base transformer model download (--skip-base-model).")
+    elif install_all or "ntv3" in selected:
+        logger.info("Downloading NTv3 base transformer model for offline use...")
+        cache_base_models(model_dir, force)
 
     logger.info("\n" + "=" * 60)
     logger.info("INSTALLATION SUMMARY")
     logger.info("=" * 60)
+
+    # mmseqs2 availability check
+    import shutil as _shutil
+    if _shutil.which("mmseqs") is not None:
+        logger.info("✓ mmseqs2 found in PATH")
+    else:
+        logger.warning(
+            "✗ mmseqs2 not found in PATH — required at runtime for geNomad marker search.\n"
+            "  Install via conda:  conda install -c bioconda mmseqs2\n"
+            "  Or via mamba:       mamba install -c bioconda mmseqs2"
+        )
 
     fold_dirs = [d for d in os.listdir(model_dir) if d.startswith("fold_")]
     if len(fold_dirs) == 5:
@@ -241,6 +424,17 @@ def main(outdir, force, debug):
         logger.info(f"✓ geNomad database present")
     else:
         logger.warning(f"✗ geNomad database incomplete at: {genomad_db_dir}")
+
+    base_models_dir = os.path.join(model_dir, "base_models")
+    if os.path.isdir(base_models_dir) and os.listdir(base_models_dir):
+        cached = [d for d in os.listdir(base_models_dir) if os.path.isdir(os.path.join(base_models_dir, d))]
+        logger.info(f"✓ Base model(s) cached locally: {', '.join(cached)}")
+    else:
+        logger.info(
+            "  Base transformer model not cached locally.\n"
+            "  Re-run vhamster-install-models to download it, or authenticate first with:\n"
+            "    huggingface-cli login"
+        )
 
     logger.info(f"\nTo run vhamster:")
     logger.info(f"  vhamster --fasta <input.fasta> --output <output_dir> --ensemble-dir {model_dir}")

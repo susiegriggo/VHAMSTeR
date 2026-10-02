@@ -87,14 +87,21 @@ pip install torch --index-url [https://download.pytorch.org/whl/cpu](https://dow
 
 Model installation is a separate step after installing `vhamster` itself.
 
-This downloads the pretrained model weights from [HuggingFace](https://huggingface.co/DOEJGI/vhamster-models) and the geNomad marker database from [Zenodo](https://zenodo.org/records/14886553):
+This downloads everything VHAMSTeR needs to run — the ensemble weights from [HuggingFace](https://huggingface.co/DOEJGI/vhamster-models), the geNomad marker database from [Zenodo](https://zenodo.org/records/14886553), and the NTv3 base transformer model from [InstaDeepAI](https://huggingface.co/InstaDeepAI/NTv3_650M_pre):
 
 ```bash
 vhamster-install-models
 ```
 
+During installation you will be asked to:
+
+1. Agree to the [InstaDeepAI licence terms](https://huggingface.co/InstaDeepAI/NTv3_650M_pre) for the NTv3 base model (non-commercial use only)
+2. Log in to HuggingFace — a browser tab will open automatically. If you do not yet have a free HuggingFace account, you can create one at [huggingface.co/join](https://huggingface.co/join) before running the command
+
+Once installation is complete, vhamster runs fully offline — no HuggingFace account is needed at runtime.
+
 By default, everything is installed into an environment-scoped location in the active Python
-environment: `site-packages/vhamster_models_v1.3.0`.
+environment: `site-packages/vhamster_models_v1.4.0`.
 
 If that default location is not writable, install to your own directory instead:
 
@@ -102,16 +109,36 @@ If that default location is not writable, install to your own directory instead:
 vhamster-install-models -o /path/to/my_vhamster_models
 ```
 
-Reinstall if needed:
+Reinstall everything if needed:
 
 ```bash
 vhamster-install-models -f
 ```
 
+Re-download a single component without touching the others:
+
+```bash
+# geNomad marker database only
+vhamster-install-models --only genomad
+
+# NTv3 base transformer model only
+vhamster-install-models --only ntv3
+
+# VHAMSTeR ensemble weights only
+vhamster-install-models --only vhamster
+```
+
+`--only` can be repeated to combine components, e.g. `--only vhamster --only ntv3`.
+
 The installer places files at:
 - `<install_root>/fold_0/` … `<install_root>/fold_4/` — ensemble model weights
 - `<install_root>/proportional_vector_scaling_scalar_nll_notclassbalanced_posthoc_fungi_nolength.json` — calibration parameters
 - `<install_root>/genomad_db/` — geNomad marker database
+- `<install_root>/base_models/` — NTv3 base transformer model
+
+> **HPC / headless systems:** If no browser is available, run `huggingface-cli login` in your terminal first, then run `vhamster-install-models`.
+
+> **Cluster shared installations:** The base model only needs to be downloaded once per shared filesystem location. If a colleague has already installed into the same `<install_root>`, you do not need to run it again.
 
 Once installed, vhamster will find the geNomad database automatically. If you have an existing geNomad database elsewhere, you can point to it with `--genomad-db`:
 
@@ -128,7 +155,7 @@ If your models are stored in a non-default location, pass the path with `--ensem
 vhamster \
   --fasta input.fasta \
   --output results/ \
-  --ensemble-dir /path/to/vhamster_models_v1.3.0
+  --ensemble-dir /path/to/vhamster_models_v1.4.0
 ```
 
 Runtime logs are written to `<output>/<prefix>.log` and also shown in the
@@ -154,7 +181,7 @@ vhamster \
   --fasta test_data/escherichia_phage.fasta \
   --output results/test_run \
   --prefix escherichia_phage \
-  --ensemble-dir /path/to/vhamster_models_v1.3.0
+  --ensemble-dir /path/to/vhamster_models_v1.4.0
 ```
 
 This writes two files:
@@ -194,7 +221,7 @@ Use a custom ensemble directory:
 vhamster \
   --fasta /path/to/input.fasta \
   --output /path/to/results_dir \
-  --ensemble-dir /path/to/vhamster_models_v1.3.0
+  --ensemble-dir /path/to/vhamster_models_v1.4.0
 ```
 
 Run using a single fold (for example, only `fold_3`):
