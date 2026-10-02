@@ -566,17 +566,79 @@ def _run(args: Any) -> None:
 
         # 4f. Load Fold Transformer & Predict
         model_artifact_dir = fold_dir / args.checkpoint_subdir
-        tokenizer = AutoTokenizer.from_pretrained(fold_config.get("tokenizer", fold_config["model"]), trust_remote_code=True)
+
+        # Resolve paths for the base transformer model and tokenizer.
+        # All local options avoid HuggingFace auth at runtime; the HuggingFace
+        # fallback is kept for users who are already authenticated.
+        _hf_model_id = fold_config.get("model")
+        _hf_tok_id = fold_config.get("tokenizer", _hf_model_id)
+        _ensemble_root = fold_dir.parent
+        _base_models_root = _ensemble_root / "base_models"
+
+        def _local_model_path(model_id: str) -> Optional[str]:
+            """Return a local directory path for model_id if cached, else None."""
+            if not model_id:
+                return None
+            candidate = _base_models_root / model_id.replace("/", "--")
+            if candidate.is_dir() and any(candidate.iterdir()):
+                return str(candidate)
+            return None
+
+        # Tokenizer source — checked in priority order:
+        #   1. Shared tokenizer/ dir at the ensemble root
+        #   2. Adapter directory (per-fold copy, if still present)
+        #   3. Locally cached base model (populated by --cache-base-model)
+        #   4. HuggingFace Hub (requires auth; gives a clear error if not authenticated)
+        _shared_tok_dir = _ensemble_root / "tokenizer"
+        _cached_base = _local_model_path(_hf_tok_id)
+        if (_shared_tok_dir / "tokenizer_config.json").exists():
+            _tok_source = str(_shared_tok_dir)
+        elif (model_artifact_dir / "tokenizer_config.json").exists():
+            _tok_source = str(model_artifact_dir)
+        elif _cached_base is not None:
+            _tok_source = _cached_base
+        else:
+            _tok_source = _hf_tok_id  # will fall through to HuggingFace
+
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(_tok_source, trust_remote_code=True)
+        except Exception as tok_err:
+            err_str = str(tok_err).lower()
+            if any(kw in err_str for kw in ("gated", "restricted", "401", "access", "log in", "login")):
+                raise click.ClickException(
+                    f"The base tokenizer '{_hf_tok_id}' is not available locally and "
+                    "downloading it requires a HuggingFace account with access to the model.\n\n"
+                    "Run the following command to download and cache the base model:\n"
+                    "    vhamster-install-models --cache-base-model\n\n"
+                    "This will display the InstaDeepAI licence terms, ask for your agreement,\n"
+                    "and open a browser tab to log in to HuggingFace."
+                ) from None
+            raise
+
         if model_type == "bibert":
             tokenizer.model_max_length = max_length
 
-        base_model, _, _, _, hidden_size = load_model_and_tokenizer(
-            model_path=str(fold_dir),
-            model_type=model_type,
-            pooling=fold_config.get("pooling", "mean"),
-            max_length=max_length,
-            base_model_name=fold_config.get("model"),
-        )
+        _local_base = _local_model_path(_hf_model_id)
+        try:
+            base_model, _, _, _, hidden_size = load_model_and_tokenizer(
+                model_path=str(fold_dir),
+                model_type=model_type,
+                pooling=fold_config.get("pooling", "mean"),
+                max_length=max_length,
+                base_model_name=_local_base if _local_base is not None else _hf_model_id,
+            )
+        except Exception as model_err:
+            err_str = str(model_err).lower()
+            if any(kw in err_str for kw in ("gated", "restricted", "401", "access", "log in", "login")):
+                raise click.ClickException(
+                    f"The base model '{_hf_model_id}' is not available locally and "
+                    "downloading it requires a HuggingFace account with access to the model.\n\n"
+                    "Run the following command to download and cache the base model:\n"
+                    "    vhamster-install-models --cache-base-model\n\n"
+                    "This will display the InstaDeepAI licence terms, ask for your agreement,\n"
+                    "and open a browser tab to log in to HuggingFace."
+                ) from None
+            raise
 
         if (model_artifact_dir / "adapter_config.json").exists():
             base_model = PeftModel.from_pretrained(base_model, model_artifact_dir)
