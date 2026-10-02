@@ -161,9 +161,18 @@ def ensure_base_model_auth(model_id: str) -> bool:
     )
 
     try:
-        answer = input("Do you agree to the NTv3 licence terms above? [yes/no]: ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        answer = ""
+        # Use /dev/tty directly so that tqdm progress-bar output that may have
+        # been written to stdout/stderr does not consume or disrupt stdin on
+        # cluster login nodes.
+        with open("/dev/tty") as _tty:
+            sys.stdout.write("Do you agree to the NTv3 licence terms above? [yes/no]: ")
+            sys.stdout.flush()
+            answer = _tty.readline().strip().lower()
+    except OSError:
+        try:
+            answer = input("Do you agree to the NTv3 licence terms above? [yes/no]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
 
     if answer not in ("yes", "y"):
         logger.warning("Licence not accepted — skipping base model download.")
