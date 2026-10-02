@@ -43,7 +43,7 @@ GENOMAD_FILES = [
 ]
 
 REQUIRED_MODEL_FILES = ["fold_0", "fold_1", "fold_2", "fold_3", "fold_4"]
-REQUIRED_ROOT_FILES = ["proportional_vector_scaling_scalar_nll_notclassbalanced_posthoc_fungi_nolength.json"]
+REQUIRED_ROOT_FILES = ["length_aware_vector_scaling_anchors_toplabel_5.json"]
 DEFAULT_MODEL_DIRNAME = "vhamster_models_v1.4.0"
 
 

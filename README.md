@@ -117,7 +117,7 @@ vhamster-install-models -f
 
 The installer places files at:
 - `<install_root>/fold_0/` … `<install_root>/fold_4/` — ensemble model weights
-- `<install_root>/proportional_vector_scaling_scalar_nll_notclassbalanced_posthoc_fungi_nolength.json` — calibration parameters
+- `<install_root>/length_aware_vector_scaling_anchors_toplabel_5.json` — calibration parameters
 - `<install_root>/genomad_db/` — geNomad marker database
 - `<install_root>/base_models/` — NTv3 base transformer model
 
@@ -224,7 +224,7 @@ Use a non-default calibration parameters file:
 vhamster \
   --fasta /path/to/input.fasta \
   --output /path/to/results_dir \
-  --calibration-params /path/to/proportional_vector_scaling_scalar_nll_notclassbalanced_posthoc_fungi_nolength.json
+  --calibration-params /path/to/length_aware_vector_scaling_anchors_toplabel_5.json
 ```
 
 ## Two-stage pipeline (HPC)
