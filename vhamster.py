@@ -587,7 +587,7 @@ def _run(args: Any) -> None:
         # Tokenizer source — checked in priority order:
         #   1. Shared tokenizer/ dir at the ensemble root
         #   2. Adapter directory (per-fold copy, if still present)
-        #   3. Locally cached base model (populated by --cache-base-model)
+        #   3. Locally cached base model (populated by vhamster-install-models)
         #   4. HuggingFace Hub (requires auth; gives a clear error if not authenticated)
         _shared_tok_dir = _ensemble_root / "tokenizer"
         _cached_base = _local_model_path(_hf_tok_id)
@@ -609,7 +609,7 @@ def _run(args: Any) -> None:
                     f"The base tokenizer '{_hf_tok_id}' is not available locally and "
                     "downloading it requires a HuggingFace account with access to the model.\n\n"
                     "Run the following command to download and cache the base model:\n"
-                    "    vhamster-install-models --cache-base-model\n\n"
+                    "    vhamster-install-models\n\n"
                     "This will display the InstaDeepAI licence terms, ask for your agreement,\n"
                     "and open a browser tab to log in to HuggingFace."
                 ) from None
@@ -634,7 +634,7 @@ def _run(args: Any) -> None:
                     f"The base model '{_hf_model_id}' is not available locally and "
                     "downloading it requires a HuggingFace account with access to the model.\n\n"
                     "Run the following command to download and cache the base model:\n"
-                    "    vhamster-install-models --cache-base-model\n\n"
+                    "    vhamster-install-models\n\n"
                     "This will display the InstaDeepAI licence terms, ask for your agreement,\n"
                     "and open a browser tab to log in to HuggingFace."
                 ) from None

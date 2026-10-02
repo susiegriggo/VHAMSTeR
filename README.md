@@ -87,13 +87,18 @@ pip install torch --index-url [https://download.pytorch.org/whl/cpu](https://dow
 
 Model installation is a separate step after installing `vhamster` itself.
 
-### Step 1 — VHAMSTeR ensemble weights and geNomad database
-
-This downloads the VHAMSTeR ensemble weights from [HuggingFace](https://huggingface.co/DOEJGI/vhamster-models) and the geNomad marker database from [Zenodo](https://zenodo.org/records/14886553). No account is required:
+This downloads everything VHAMSTeR needs to run — the ensemble weights from [HuggingFace](https://huggingface.co/DOEJGI/vhamster-models), the geNomad marker database from [Zenodo](https://zenodo.org/records/14886553), and the NTv3 base transformer model from [InstaDeepAI](https://huggingface.co/InstaDeepAI/NTv3_650M_pre):
 
 ```bash
 vhamster-install-models
 ```
+
+During installation you will be asked to:
+
+1. Agree to the [InstaDeepAI licence terms](NTV3_MODEL-LICENSE.md) for the NTv3 base model (non-commercial use only)
+2. Log in to HuggingFace — a browser tab will open automatically. If you do not yet have a free HuggingFace account, you can create one at [huggingface.co/join](https://huggingface.co/join) before running the command
+
+Once installation is complete, vhamster runs fully offline — no HuggingFace account is needed at runtime.
 
 By default, everything is installed into an environment-scoped location in the active Python
 environment: `site-packages/vhamster_models_v1.4.0`.
@@ -114,28 +119,11 @@ The installer places files at:
 - `<install_root>/fold_0/` … `<install_root>/fold_4/` — ensemble model weights
 - `<install_root>/proportional_vector_scaling_scalar_nll_notclassbalanced_posthoc_fungi_nolength.json` — calibration parameters
 - `<install_root>/genomad_db/` — geNomad marker database
+- `<install_root>/base_models/` — NTv3 base transformer model
 
-### Step 2 — NTv3 base transformer model
+> **HPC / headless systems:** If no browser is available, run `huggingface-cli login` in your terminal first, then run `vhamster-install-models`.
 
-VHAMSTeR uses [NTv3_650M_pre](https://huggingface.co/InstaDeepAI/NTv3_650M_pre) (InstaDeepAI) as its underlying genomic language model. This model is subject to the [InstaDeep Open Model Licence](NTV3_MODEL-LICENSE.md) (non-commercial use only) and requires a free HuggingFace account to download.
-
-Run the following command to download and cache it locally:
-
-```bash
-vhamster-install-models --cache-base-model
-```
-
-This will:
-
-1. Display a summary of the InstaDeepAI licence terms and ask you to agree
-2. Open a browser tab to log in to HuggingFace (or prompt for a token on headless systems)
-3. Download the base model to `<install_root>/base_models/`
-
-Once cached, vhamster runs fully offline — no HuggingFace account is needed at runtime.
-
-> **HPC / headless systems:** If no browser is available, cancel the prompt and run `huggingface-cli login` in your terminal first, then re-run `vhamster-install-models --cache-base-model`.
-
-> **Cluster shared installations:** The base model only needs to be downloaded once per shared filesystem location. If a colleague has already run `--cache-base-model` into the same `<install_root>`, you do not need to run it again.
+> **Cluster shared installations:** The base model only needs to be downloaded once per shared filesystem location. If a colleague has already installed into the same `<install_root>`, you do not need to run it again.
 
 Once installed, vhamster will find the geNomad database automatically. If you have an existing geNomad database elsewhere, you can point to it with `--genomad-db`:
 

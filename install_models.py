@@ -183,12 +183,12 @@ def ensure_base_model_auth(model_id: str) -> bool:
     try:
         login()  # opens a browser tab; falls back to token prompt if no browser
     except Exception as e:
-        logger.warning(f"Browser login failed ({e}). Run 'huggingface-cli login' manually, then re-run vhamster-install-models --cache-base-model")
+        logger.warning(f"Browser login failed ({e}). Run 'huggingface-cli login' manually, then re-run vhamster-install-models")
         return False
 
     token = get_token()
     if not token:
-        logger.warning("Login did not complete. Re-run vhamster-install-models --cache-base-model after authenticating.")
+        logger.warning("Login did not complete. Re-run vhamster-install-models after authenticating.")
         return False
 
     logger.info("HuggingFace login successful.")
@@ -338,13 +338,12 @@ def install_genomad(model_dir: str, force: bool = False):
               help="Directory to install models into (default: environment site-packages).")
 @click.option("-f", "--force", is_flag=True, default=False,
               help="Force reinstallation even if models already exist.")
-@click.option("--cache-base-model", is_flag=True, default=False,
-              help="Also download the base transformer model from HuggingFace for offline use. "
-                   "Requires 'huggingface-cli login' first if the model is gated. "
-                   "Not needed if the base model is already bundled in the DOEJGI repo.")
+@click.option("--skip-base-model", is_flag=True, default=False,
+              help="Skip downloading the NTv3 base transformer model. "
+                   "Use only if you have already cached it or intend to authenticate later.")
 @click.option("--debug", is_flag=True, default=False,
               help="Enable verbose debug logging.")
-def main(outdir, force, debug, cache_base_model):
+def main(outdir, force, debug, skip_base_model):
     """Download and install VHAMSTeR models from HuggingFace and the geNomad
     marker database from Zenodo."""
     configure_logging(debug)
@@ -355,8 +354,10 @@ def main(outdir, force, debug, cache_base_model):
     instantiate_install(model_dir, force)
     install_genomad(model_dir, force)
 
-    if cache_base_model:
-        logger.info("Caching base transformer model(s) for offline use...")
+    if skip_base_model:
+        logger.info("Skipping base transformer model download (--skip-base-model).")
+    else:
+        logger.info("Downloading NTv3 base transformer model for offline use...")
         cache_base_models(model_dir, force)
 
     logger.info("\n" + "=" * 60)
@@ -399,8 +400,8 @@ def main(outdir, force, debug, cache_base_model):
     else:
         logger.info(
             "  Base transformer model not cached locally.\n"
-            "  If it is bundled in the DOEJGI repo it will load from the install directory.\n"
-            "  Otherwise run:  huggingface-cli login  then  vhamster-install-models --cache-base-model"
+            "  Re-run vhamster-install-models to download it, or authenticate first with:\n"
+            "    huggingface-cli login"
         )
 
     logger.info(f"\nTo run vhamster:")
