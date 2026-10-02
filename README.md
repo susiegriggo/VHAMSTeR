@@ -1,6 +1,10 @@
 # VHAMSTeR
 ![](vhamsterlogo.png)
 
+[![PyPI version](https://img.shields.io/pypi/v/vhamster)](https://pypi.org/project/vhamster/)
+[![PyPI downloads](https://img.shields.io/pypi/dm/vhamster)](https://pypi.org/project/vhamster/)
+[![Conda downloads](https://img.shields.io/conda/dn/bioconda/vhamster)](https://anaconda.org/bioconda/vhamster)
+[![install with bioconda](https://img.shields.io/badge/install%20with-bioconda-brightgreen.svg?style=flat)](https://bioconda.github.io/recipes/vhamster/README.html)
 
 **V**irus **H**ost **A**ssignment **M**odel using **S**equence **T**ransformers and **R**eading-frames
 
@@ -136,7 +140,13 @@ The installer places files at:
 - `<install_root>/genomad_db/` — geNomad marker database
 - `<install_root>/base_models/` — NTv3 base transformer model
 
-> **HPC / headless systems:** If no browser is available, run `huggingface-cli login` in your terminal first, then run `vhamster-install-models`.
+> **HPC / headless systems:** If no browser is available, either run `huggingface-cli login` in your terminal first, or pass your token directly:
+> ```bash
+> vhamster-install-models --hf-token $HF_TOKEN
+> # or set the environment variable (safer — token won't appear in process listings):
+> export HF_TOKEN=hf_xxxx
+> vhamster-install-models
+> ```
 
 > **Cluster shared installations:** The base model only needs to be downloaded once per shared filesystem location. If a colleague has already installed into the same `<install_root>`, you do not need to run it again.
 
