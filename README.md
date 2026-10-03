@@ -208,6 +208,13 @@ this *Escherichia* phage.
 
 ## Run
 
+To see all available options:
+
+```bash
+vhamster --help            # common options
+vhamster --help-advanced   # all options including advanced/expert ones
+```
+
 Minimal example (models at their default installed location):
 
 ```bash
@@ -268,7 +275,7 @@ vhamster-features \
 This writes:
 - `features/batch_001/batch_001.arch_features.tsv` — per-chunk architectural features
 - `features/batch_001/batch_001.genomad_hits.json` — geNomad marker hits
-- `features/batch_001/batch_001.gene_predictions.tsv` — per-gene annotations
+- `features/batch_001/batch_001.viral_marker_genes.tsv` — per-gene annotations
 
 **Stage 2 — GLM inference (GPU node):**
 
@@ -290,8 +297,12 @@ For prefix `sampleA`, the unconditional output files are:
 - `/path/to/results_dir/sampleA.genomes.tsv` — genome-level consensus (mean-pooled over chunks)
 - `/path/to/results_dir/sampleA.folds.tsv` — per-fold predictions and GLM gate weights for all 5 ensemble members
 
-If the `--verbose` flag is passed, an additional file is generated:
-- `/path/to/results_dir/sampleA.verbose.tsv` — detailed per-fold uncalibrated stream probabilities, uncalibrated ensemble probabilities, and raw feature arrays.
+Optional additional files (one or both flags can be combined):
+
+| Flag | File | Contents |
+|------|------|----------|
+| `--model-scores` | `sampleA.model_scores.tsv` | Per-fold XGBoost, GLM and uncalibrated ensemble probabilities — use this to inspect individual model component scores |
+| `--save-features` | `sampleA.features.tsv` | Input features fed to the model per chunk — architectural stats and geNomad marker features |
 
 ### Chunk Naming Convention
 Sequences longer than the specified chunk size (default 10 kbp) are split into smaller fragments. The `accession` column for these fragments will include a `_chunk<start>_<end>` suffix (e.g., `NC_007026.1_chunk0_10000`). You can use this suffix or the `sampleA.genomes.tsv` file to join chunk-level predictions back to your original input sequences.
@@ -312,13 +323,17 @@ Sequences longer than the specified chunk size (default 10 kbp) are split into s
 - `accession`, `fold`, `predicted_host`, `confidence`, `glm_gate_weight`
 - calibrated class probability columns
 
-**Verbose file columns include:**
+**Model scores file (`--model-scores`) columns include:**
 - `accession`, `fold`, `n_genes`, `predicted_host`, `confidence`, `glm_gate_weight`
 - calibrated class probability columns
 - `xgb_<class>` (pure, uncalibrated XGBoost probabilities)
 - `glm_<class>` (pure, uncalibrated GLM probabilities)
 - `uncalibrated_ensemble_<class>` (the exact mathematical output of the dynamic gate before temperature scaling)
-- All raw architectural and marker features
+
+**Features file (`--save-features`) columns include:**
+- `accession`
+- All architectural features (gene density, fragment size, etc.)
+- All geNomad marker features
 
 ## Performance & Batching Tips
 
