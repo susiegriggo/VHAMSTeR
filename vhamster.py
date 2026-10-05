@@ -386,8 +386,8 @@ def _run(args: Any) -> None:
         with open(hits_json) as _fh:
             genomad_marker_dict = json.load(_fh)
         annotation_rows = []
-        gene_pred_src = feat_dir / f"{args.prefix}.gene_predictions.tsv"
-        gene_table_path = args.output_dir / f"{args.prefix}.gene_predictions.tsv"
+        gene_pred_src = feat_dir / f"{args.prefix}.viral_marker_genes.tsv"
+        gene_table_path = args.output_dir / f"{args.prefix}.viral_marker_genes.tsv"
         if gene_pred_src.exists():
             shutil.copy2(gene_pred_src, gene_table_path)
             logger.info(f"      Gene prediction table copied to: {gene_table_path}")
@@ -436,7 +436,7 @@ def _run(args: Any) -> None:
         )
         genomad_marker_dict = marker_hits
 
-        gene_table_path = args.output_dir / f"{args.prefix}.gene_predictions.tsv"
+        gene_table_path = args.output_dir / f"{args.prefix}.viral_marker_genes.tsv"
         write_annotation_rows(annotation_rows, gene_table_path)
         logger.info(f"      Gene prediction table written to: {gene_table_path}")
 
@@ -446,8 +446,19 @@ def _run(args: Any) -> None:
     logger.info("[4/5] Running ensemble inference across folds")
     accumulated_logits: Optional[torch.Tensor] = None
     accumulated_xgb_probs: Optional[np.ndarray] = None
+    # Pre-compute these once — used in every fold for calibration and output writing.
+    chunk_lengths = [len(s) for s in chunked_seqs]
+    class_cols = [label_mapping.get(i, f"class_{i}") for i in range(num_classes)]
+    n_genes_list = features_df_arch.get_column('n_genes').to_list()
+
     per_fold_basic: List[Dict] = []
-    per_fold_verbose: List[Dict] = [] if args.verbose else None
+    _saved_features: Optional[List[Dict]] = None  # captured from first fold for --save-features
+
+    # Streaming output state — write each fold to disk immediately to avoid RAM accumulation.
+    folds_path = args.output_dir / f"{args.prefix}.folds.tsv"
+    scores_path = args.output_dir / f"{args.prefix}.model_scores.tsv"
+    _folds_written = False
+    _scores_written = False
 
     for fold_idx, fold_dir in enumerate(args.fold_dirs_resolved, start=1):
         logger.info(f"--- Fold {fold_idx}/{len(args.fold_dirs_resolved)}: {fold_dir.name} ---")
@@ -515,6 +526,8 @@ def _run(args: Any) -> None:
         unique_euk_cols = [c for c in x_euk_df.columns if c not in x_all_df.columns]
         fold_features_df = pl.concat([x_all_df, x_euk_df.select(unique_euk_cols)], how="horizontal")
         fold_features_dicts = fold_features_df.to_dicts()
+        if args.save_features and _saved_features is None:
+            _saved_features = fold_features_dicts
 
         # 3. XGBoost Predictions
         expected_xgb1 = xgb_spec["feature_columns_xgb1"]
@@ -702,19 +715,19 @@ def _run(args: Any) -> None:
         fold_logits_list = []
         fold_alphas_list = []
         fold_accessions_order = []
-        fold_glm_logits_list = [] if args.verbose else None
+        fold_glm_logits_list = [] if args.model_scores else None
 
         with torch.no_grad():
             for batch in tqdm(dataloader, desc=f"      Inference", leave=False):
                 inputs = {k: v.to(device) for k, v in batch.items() if k not in {'accession', 'labels'}}
-                extra_kwargs = {"return_auxiliary_logits": True} if args.verbose else {}
+                extra_kwargs = {"return_auxiliary_logits": True} if args.model_scores else {}
                 if args.fp16 and device.type == 'cuda':
                     with torch.amp.autocast('cuda'):
                         outputs = classifier(**inputs, **extra_kwargs)
                 else:
                     outputs = classifier(**inputs, **extra_kwargs)
                 
-                if args.verbose:
+                if args.model_scores:
                     logits = outputs[0]
                     glm_batch = outputs[1]
                     fold_glm_logits_list.append(glm_batch.cpu() if glm_batch is not None else None)
@@ -742,31 +755,70 @@ def _run(args: Any) -> None:
         else:
             fold_alphas = np.full(len(chunked_seqs), np.nan)
         
-        per_fold_basic.append({"fold_name": fold_dir.name, "logits": fold_logits, "alphas": fold_alphas})
+        # Apply per-fold calibration immediately so probs are available for streaming output.
+        fold_probs = _apply_calibration(fold_logits, calib_params, chunk_lengths, num_classes)
+        per_fold_basic.append({"fold_name": fold_dir.name, "logits": fold_logits, "alphas": fold_alphas, "probs": fold_probs})
 
-        if args.verbose:
-            # 1. Pure, uncalibrated XGBoost probabilities
+        # ── Stream folds.tsv for this fold ───────────────────────────────────
+        fold_pred_indices = np.argmax(fold_probs, axis=1)
+        fold_confidences = np.max(fold_probs, axis=1)
+        fold_predicted_hosts = [label_mapping.get(int(i), f"class_{i}") for i in fold_pred_indices]
+        df_fold = pl.DataFrame([
+            {
+                "accession": acc,
+                "fold": fold_dir.name,
+                "predicted_host": fold_predicted_hosts[j],
+                "confidence": round(float(fold_confidences[j]), 4),
+                "glm_gate_weight": None if np.isnan(fold_alphas[j]) else round(float(fold_alphas[j]), 4),
+                **{col: round(float(fold_probs[j, i]), 4) for i, col in enumerate(class_cols)},
+            }
+            for j, acc in enumerate(chunked_accs)
+        ])
+        with open(folds_path, "a" if _folds_written else "w", newline="") as _fh:
+            df_fold.write_csv(_fh, separator="\t", include_header=not _folds_written, null_value="")
+        _folds_written = True
+        del df_fold, fold_pred_indices, fold_confidences, fold_predicted_hosts
+
+        # ── Stream model_scores.tsv for this fold (if requested) ─────────────
+        if args.model_scores:
             fold_xgb_probs = np.round(xgb_probs, 4)
-            
-            # 2. Pure, uncalibrated GLM probabilities
             if fold_glm_logits_list and all(x is not None for x in fold_glm_logits_list):
                 concat_glm = torch.cat(fold_glm_logits_list, dim=0)[reorder_indices]
                 fold_glm_probs = np.round(F.softmax(concat_glm, dim=-1).numpy(), 4)
             else:
                 fold_glm_probs = None
-
-            # 3. Pure, uncalibrated Ensemble probabilities (The raw math output from the gate)
             fold_raw_ensemble_probs = np.round(torch.softmax(fold_logits, dim=-1).numpy(), 4)
-                
-            per_fold_verbose.append({
-                "fold_name": fold_dir.name,
-                "logits": fold_logits,
-                "alphas": fold_alphas,
-                "features": fold_features_dicts,
-                "xgb_probs": fold_xgb_probs,
-                "glm_probs": fold_glm_probs,
-                "raw_ensemble_probs": fold_raw_ensemble_probs,
-            })
+
+            _score_fold_pred_indices = np.argmax(fold_probs, axis=1)
+            _score_fold_confidences = np.max(fold_probs, axis=1)
+            _score_fold_hosts = [label_mapping.get(int(i), f"class_{i}") for i in _score_fold_pred_indices]
+            score_rows = []
+            for j, acc in enumerate(chunked_accs):
+                row: Dict = {
+                    "accession": acc,
+                    "fold": fold_dir.name,
+                    "n_genes": n_genes_list[j],
+                    "predicted_host": _score_fold_hosts[j],
+                    "confidence": float(_score_fold_confidences[j]),
+                    "glm_gate_weight": None if np.isnan(fold_alphas[j]) else float(fold_alphas[j]),
+                    **{col: float(fold_probs[j, i]) for i, col in enumerate(class_cols)},
+                }
+                if fold_xgb_probs is not None:
+                    for i, col in enumerate(class_cols):
+                        row[f"xgb_{col}"] = float(fold_xgb_probs[j, i])
+                if fold_glm_probs is not None:
+                    for i, col in enumerate(class_cols):
+                        row[f"glm_{col}"] = float(fold_glm_probs[j, i])
+                if fold_raw_ensemble_probs is not None:
+                    for i, col in enumerate(class_cols):
+                        row[f"uncalibrated_ensemble_{col}"] = float(fold_raw_ensemble_probs[j, i])
+                score_rows.append(row)
+            df_scores = pl.DataFrame(score_rows)
+            with open(scores_path, "a" if _scores_written else "w", newline="") as _fh:
+                df_scores.write_csv(_fh, separator="\t", include_header=not _scores_written, null_value="")
+            _scores_written = True
+            del df_scores, score_rows, fold_xgb_probs, fold_glm_probs, fold_raw_ensemble_probs
+            del _score_fold_pred_indices, _score_fold_confidences, _score_fold_hosts
             
         if accumulated_logits is None:
             accumulated_logits = fold_logits.clone()
@@ -780,16 +832,8 @@ def _run(args: Any) -> None:
 
    # ── [5/5] Post-Ensemble Calibration & Aggregation ────────────────────────
     logger.info(f"[5/5] Applying calibration & chunk aggregation (Mode: {args.aggregation_mode})")
-    chunk_lengths = [len(s) for s in chunked_seqs]
 
-    # 1. Pre-calculate individual calibrated probabilities for ALL folds
-    for fold_data in per_fold_basic:
-        fold_data["probs"] = _apply_calibration(fold_data["logits"], calib_params, chunk_lengths, num_classes)
-        
-    if args.verbose:
-        for fold_data in per_fold_verbose:
-            fold_data["probs"] = _apply_calibration(fold_data["logits"], calib_params, chunk_lengths, num_classes)
-
+    # Per-fold probs were already applied during the fold loop; aggregate here.
     # 2. Aggregate according to the selected mode
     if args.aggregation_mode == "logit":
         # Standard: average the raw logits, then calibrate the result
@@ -824,8 +868,6 @@ def _run(args: Any) -> None:
         calibrated_probs = np.round(weighted_probs.sum(axis=0), 4)
 
     
-    class_cols = [label_mapping.get(i, f"class_{i}") for i in range(num_classes)]
-
     pred_indices = np.argmax(calibrated_probs, axis=1)
     confidences_arr = np.max(calibrated_probs, axis=1)
     
@@ -875,74 +917,29 @@ def _run(args: Any) -> None:
         logger.info(f"Genome-level predictions written to: {args.genome_output}")
 
         
-    fold_rows: List[Dict] = []
-    for fold_data in per_fold_basic:
-        fold_probs = fold_data["probs"]
-        fold_alphas = fold_data["alphas"]
-        fold_pred_indices = np.argmax(fold_probs, axis=1)
-        fold_confidences = np.max(fold_probs, axis=1)
-        fold_predicted_hosts = [label_mapping.get(int(i), f"class_{i}") for i in fold_pred_indices]
-        for j, acc in enumerate(chunked_accs):
-            row: Dict = {
-                "accession": acc,
-                "fold": fold_data["fold_name"],
-                "predicted_host": fold_predicted_hosts[j],
-                "confidence": round(float(fold_confidences[j]), 4),
-                "glm_gate_weight": None if np.isnan(fold_alphas[j]) else round(float(fold_alphas[j]), 4),
-                **{col: round(float(fold_probs[j, i]), 4) for i, col in enumerate(class_cols)},
-            }
-            fold_rows.append(row)
-    df_folds = pl.DataFrame(fold_rows).sort(["accession", "fold"])
-    folds_path = args.output_dir / f"{args.prefix}.folds.tsv"
-    df_folds.write_csv(folds_path, separator="\t", null_value="")
     logger.info(f"Per-fold predictions written to: {folds_path}")
+    if args.model_scores:
+        logger.info(f"Per-fold model scores written to: {scores_path}")
 
-    if args.verbose and per_fold_verbose:
-        verbose_rows = []
-
-        n_genes_list = features_df_arch.get_column('n_genes').to_list()
-
-        for fold_data in per_fold_verbose:
-            fold_probs = fold_data["probs"]
-            fold_alphas = fold_data["alphas"]
-            fold_pred_indices = np.argmax(fold_probs, axis=1)
-            fold_confidences = np.max(fold_probs, axis=1)
-            fold_predicted_hosts = [label_mapping.get(int(i), f"class_{i}") for i in fold_pred_indices]
-            for j, acc in enumerate(chunked_accs):
-                row: Dict = {
-                    "accession": acc,
-                    "fold": fold_data["fold_name"],
-                    "n_genes": n_genes_list[j],
-                    "predicted_host": fold_predicted_hosts[j],
-                    "confidence": float(fold_confidences[j]),
-                    "glm_gate_weight": None if np.isnan(fold_alphas[j]) else float(fold_alphas[j]),
-                }
-                for i, col in enumerate(class_cols):
-                    row[col] = float(fold_probs[j, i])
-
-                if fold_data.get("xgb_probs") is not None:
-                    for i, col in enumerate(class_cols):
-                        row[f"xgb_{col}"] = float(fold_data["xgb_probs"][j, i])
-                if fold_data.get("glm_probs") is not None:
-                    for i, col in enumerate(class_cols):
-                        row[f"glm_{col}"] = float(fold_data["glm_probs"][j, i])
-                if fold_data.get("raw_ensemble_probs") is not None:
-                    for i, col in enumerate(class_cols):
-                        row[f"uncalibrated_ensemble_{col}"] = float(fold_data["raw_ensemble_probs"][j, i])
-                        
-                # inject all architecture and marker features
-                row.update(fold_data["features"][j])
-
-                verbose_rows.append(row)
-
-        df_verbose = pl.DataFrame(verbose_rows).sort(["accession", "fold"])
-        verbose_path = args.output_dir / f"{args.prefix}.verbose.tsv"
-        df_verbose.write_csv(verbose_path, separator="\t")
-        logger.info(f"Verbose per-fold predictions written to: {verbose_path}")
+    if args.save_features and _saved_features is not None:
+        feature_rows = [{"accession": acc, **feats}
+                        for acc, feats in zip(chunked_accs, _saved_features)]
+        features_path = args.output_dir / f"{args.prefix}.features.tsv"
+        pl.DataFrame(feature_rows).write_csv(features_path, separator="\t")
+        logger.info(f"Input features written to: {features_path}")
 
     for line in _HAMSTER_FACE_ART.splitlines():
         logger.info(line)
     logger.info("Done!")
+
+def _advanced_help_callback(ctx, _param, value):
+    if not value or ctx.resilient_parsing:
+        return
+    for p in ctx.command.params:
+        p.hidden = False
+    click.echo(ctx.get_help())
+    ctx.exit()
+
 
 @click.command(context_settings={"help_option_names": ["-h", "--help"]})
 @click.option("--fasta", type=click.Path(path_type=pathlib.Path, exists=True, dir_okay=False), required=True, help="Input FASTA file.")
@@ -950,10 +947,12 @@ def _run(args: Any) -> None:
 @click.option("--prefix", default="vhamster", show_default=True, help="Base filename prefix for output files.")
 @click.option("--genomad-db", type=click.Path(path_type=pathlib.Path), default=None, help="geNomad MMseqs2 DB path.")
 @click.option("--ensemble-dir", type=click.Path(path_type=pathlib.Path), default=_DEFAULT_MODEL_ROOT, show_default=True, help="Root directory containing fold_* subdirs (used to locate geNomad DB if --genomad-db not set).")
-@click.option("--chunk-size", type=int, default=10000, show_default=True, help="Chunk length in bp (must match value used with vhamster).")
-@click.option("--overlap", type=int, default=1000, show_default=True, help="Overlap between chunks in bp (must match value used with vhamster).")
 @click.option("--num-workers", type=int, default=4, show_default=True, help="Worker processes for PyRodigal feature extraction.")
-@click.option("--mmseqs-threads", type=int, default=None, help="Threads for protein prediction and MMseqs2 search. Defaults to --num-workers when not set, so on a cluster you can just set --num-workers to your CPU count and both steps scale together.")
+@click.option("--help-advanced", is_flag=True, is_eager=True, expose_value=False,
+              callback=_advanced_help_callback, help="Show all options including advanced ones.")
+@click.option("--chunk-size", type=int, default=10000, show_default=True, hidden=True, help="Chunk length in bp (must match value used with vhamster).")
+@click.option("--overlap", type=int, default=1000, show_default=True, hidden=True, help="Overlap between chunks in bp (must match value used with vhamster).")
+@click.option("--mmseqs-threads", type=int, default=None, hidden=True, help="Threads for protein prediction and MMseqs2 search. Defaults to --num-workers when not set.")
 def features_main(
     fasta: pathlib.Path,
     output: pathlib.Path,
@@ -1039,7 +1038,7 @@ def features_main(
         json.dump(marker_hits, fh)
     logger.info(f"geNomad marker hits written to: {hits_json}")
 
-    gene_table_path = output_dir / f"{prefix}.gene_predictions.tsv"
+    gene_table_path = output_dir / f"{prefix}.viral_marker_genes.tsv"
     write_annotation_rows(annotation_rows, gene_table_path)
     logger.info(f"Gene prediction table written to: {gene_table_path}")
     logger.info("Feature extraction complete.")
@@ -1102,31 +1101,36 @@ def _preflight_checks(args: Any) -> None:
 
 
 @click.command(context_settings={"help_option_names": ["-h", "--help"]})
+# ── Common options ────────────────────────────────────────────────────────────
 @click.option("--fasta", type=click.Path(path_type=pathlib.Path, exists=True, dir_okay=False), required=True, help="Input FASTA file.")
 @click.option("--output", type=click.Path(path_type=pathlib.Path, file_okay=False), required=True, help="Output directory.")
 @click.option("--prefix", default="vhamster", show_default=True, help="Base filename prefix for outputs.")
 @click.option("-f", "--force", "force", is_flag=True, help="Overwrite output if it exists.")
 @click.option("--ensemble-dir", type=click.Path(path_type=pathlib.Path), default=_DEFAULT_MODEL_ROOT, show_default=True, help="Root directory containing fold_* subdirs.")
-@click.option("--fold-dirs", type=click.Path(path_type=pathlib.Path), multiple=True, help="Explicit fold directories (overrides --ensemble-dir).")
 @click.option("--genomad-db", type=click.Path(path_type=pathlib.Path), default=None, help="geNomad MMseqs2 DB path.")
-@click.option("--num-folds", type=int, default=5, show_default=True, help="Number of folds to use.")
-@click.option("--fold-index", type=int, default=None, help="Use only one fold by index, e.g. 0..4.")
-@click.option("--checkpoint-subdir", default="best_macro_auprc_model", show_default=True, help="Checkpoint subdirectory name.")
-@click.option("--calibration-params", type=str, default=str(_DEFAULT_MODEL_ROOT / "proportional_vector_scaling_scalar_nll_notclassbalanced_posthoc_fungi_nolength.json"), show_default=True, help="Path to the vector scaling + post-hoc top-label calibration JSON.")
-@click.option("--chunk-size", type=int, default=10000, show_default=True, help="Chunk length in bp.")
-@click.option("--overlap", type=int, default=1000, show_default=True, help="Overlap between chunks in bp.")
-@click.option("--batch-size", type=int, default=16, show_default=True, help="Inference batch size.")
-@click.option("--fp16", is_flag=True, help="Use FP16 mixed precision.")
 @click.option("--num-workers", type=int, default=4, show_default=True, help="DataLoader workers.")
-@click.option("--mmseqs-threads", type=int, default=4, show_default=True, help="Threads for protein prediction and MMseqs2 search (only used when --precomputed-features is not set).")
 @click.option("--precomputed-features", type=click.Path(path_type=pathlib.Path), default=None, help="Directory containing {prefix}.arch_features.tsv and {prefix}.genomad_hits.json from vhamster-features. Skips MMseqs2 and PyRodigal.")
-@click.option("--aggregate-chunks/--no-aggregate-chunks", default=True, show_default=True, help="Enable/disable genome-level consensus output.")
-@click.option("--verbose", is_flag=True, help="Write per-fold predictions and GLM gate weights to {prefix}.verbose.tsv.")
-@click.option("--mask-features", type=click.Choice(['none', 'density', 'boundary', 'density_plus_boundary']), default='none', help = 'Conditionally mask out specific feature sets with NaNs for ablation testing')
-@click.option("--mask-target", type=click.Choice(['all', 'xgb1_only', 'xgb2_only']), default='all', help='Which XGBoost model to apply the mask to.') # just mask one of the layers of the feature branch 
-@click.option("--min-coverage", type=float, default=0.0, show_default=True, help="Minimum bidirectional coverage threshold (0.0 to 1.0).")
-@click.option("--evalue", type=float, default=1e-3, show_default=True, help="E-value threshold for MMseqs2 marker hits.")
-@click.option("--aggregation-mode", type=click.Choice(['logit', 'probability', 'entropy']), default='logit', show_default=True, help="Method used to aggregate fold predictions.")
+@click.option("--model-scores", "model_scores", is_flag=True, help="Write per-fold XGBoost, GLM and ensemble scores to {prefix}.model_scores.tsv.")
+@click.option("--save-features", "save_features", is_flag=True, help="Write the input features used by the model to {prefix}.features.tsv.")
+@click.option("--help-advanced", is_flag=True, is_eager=True, expose_value=False,
+              callback=_advanced_help_callback, help="Show all options including advanced ones.")
+# ── Advanced options (hidden from default --help) ─────────────────────────────
+@click.option("--fold-index", type=int, default=None, hidden=True, help="Use only one fold by index, e.g. 0..4.")
+@click.option("--fold-dirs", type=click.Path(path_type=pathlib.Path), multiple=True, hidden=True, help="Explicit fold directories (overrides --ensemble-dir).")
+@click.option("--num-folds", type=int, default=5, show_default=True, hidden=True, help="Number of folds to use.")
+@click.option("--checkpoint-subdir", default="best_macro_auprc_model", show_default=True, hidden=True, help="Checkpoint subdirectory name.")
+@click.option("--calibration-params", type=str, default=str(_DEFAULT_MODEL_ROOT / "proportional_vector_scaling_scalar_nll_notclassbalanced_posthoc_fungi_nolength.json"), show_default=True, hidden=True, help="Path to the vector scaling + post-hoc top-label calibration JSON.")
+@click.option("--chunk-size", type=int, default=10000, show_default=True, hidden=True, help="Chunk length in bp.")
+@click.option("--overlap", type=int, default=1000, show_default=True, hidden=True, help="Overlap between chunks in bp.")
+@click.option("--batch-size", type=int, default=16, show_default=True, hidden=True, help="Inference batch size.")
+@click.option("--fp16", is_flag=True, hidden=True, help="Use FP16 mixed precision.")
+@click.option("--mmseqs-threads", type=int, default=4, show_default=True, hidden=True, help="Threads for protein prediction and MMseqs2 search (only used when --precomputed-features is not set).")
+@click.option("--aggregate-chunks/--no-aggregate-chunks", default=True, show_default=True, hidden=True, help="Enable/disable genome-level consensus output.")
+@click.option("--min-coverage", type=float, default=0.0, show_default=True, hidden=True, help="Minimum bidirectional coverage threshold (0.0 to 1.0).")
+@click.option("--evalue", type=float, default=1e-3, show_default=True, hidden=True, help="E-value threshold for MMseqs2 marker hits.")
+@click.option("--aggregation-mode", type=click.Choice(['logit', 'probability', 'entropy']), default='logit', show_default=True, hidden=True, help="Method used to aggregate fold predictions.")
+@click.option("--mask-features", type=click.Choice(['none', 'density', 'boundary', 'density_plus_boundary']), default='none', hidden=True, help="Conditionally mask out specific feature sets with NaNs for ablation testing.")
+@click.option("--mask-target", type=click.Choice(['all', 'xgb1_only', 'xgb2_only']), default='all', hidden=True, help="Which XGBoost model to apply the mask to.")
 
 def main(
     fasta: pathlib.Path,
@@ -1150,7 +1154,8 @@ def main(
     mask_features: str,
     aggregate_chunks: bool,
     mask_target: str,
-    verbose: bool,
+    model_scores: bool,
+    save_features: bool,
     aggregation_mode: str,
     evalue: float,
     min_coverage: float,
@@ -1198,7 +1203,8 @@ def main(
         genome_output=output_dir / f"{prefix}.genomes.tsv",
         mask_features=mask_features,
         mask_target=mask_target,
-        verbose=verbose,
+        model_scores=model_scores,
+        save_features=save_features,
         evalue=evalue,
         aggregation_mode=aggregation_mode,
         min_coverage=min_coverage,

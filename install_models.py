@@ -129,16 +129,19 @@ _NTV3_LICENSE_SUMMARY = """
 """
 
 
-def ensure_base_model_auth(model_id: str) -> bool:
+def ensure_base_model_auth(model_id: str, token: str = None) -> bool:
     """Ensure the user is authenticated and has access to a gated HuggingFace model.
 
     Displays the NTv3 licence summary, asks for agreement, and guides the user
     through HuggingFace login if they are not already authenticated.  Returns
     True when the model is accessible, False otherwise.
+
+    If `token` is provided it is used directly and the interactive login step
+    is skipped (suitable for CI/workflow environments).
     """
     # Check whether the model is actually gated before asking anything.
     try:
-        info = model_info(model_id)
+        info = model_info(model_id, token=token)
         is_gated = bool(info.gated)
     except Exception:
         is_gated = True  # assume gated if we cannot check
@@ -173,16 +176,23 @@ def ensure_base_model_auth(model_id: str) -> bool:
         logger.warning("Licence not accepted — skipping base model download.")
         return False
 
-    # Check whether a HuggingFace token is already cached.
-    token = get_token()
+    # If a token was passed directly (e.g. from --hf-token or HF_TOKEN env var),
+    # use it without an interactive login step.
     if token:
+        logger.info("HuggingFace token provided — skipping browser login.")
+        return True
+
+    # Check whether a HuggingFace token is already cached by huggingface-cli.
+    cached = get_token()
+    if cached:
         logger.info("HuggingFace credentials already present.")
         return True
 
     # No token — offer browser-based login (opens huggingface.co in the browser).
     logger.info(
         "No HuggingFace login detected.  Opening your browser to log in.\n"
-        "If you prefer the command line, cancel and run:  huggingface-cli login"
+        "If you prefer the command line, cancel and run:  huggingface-cli login\n"
+        "For non-interactive environments set the HF_TOKEN environment variable."
     )
     try:
         login()  # opens a browser tab; falls back to token prompt if no browser
@@ -190,8 +200,7 @@ def ensure_base_model_auth(model_id: str) -> bool:
         logger.warning(f"Browser login failed ({e}). Run 'huggingface-cli login' manually, then re-run vhamster-install-models")
         return False
 
-    token = get_token()
-    if not token:
+    if not get_token():
         logger.warning("Login did not complete. Re-run vhamster-install-models after authenticating.")
         return False
 
@@ -199,7 +208,7 @@ def ensure_base_model_auth(model_id: str) -> bool:
     return True
 
 
-def cache_base_models(model_dir: str, force: bool = False) -> bool:
+def cache_base_models(model_dir: str, force: bool = False, token: str = None) -> bool:
     """Download and cache the base transformer model(s) required by each fold.
 
     Reads each fold's config.json to discover the HuggingFace model ID, then
@@ -233,12 +242,12 @@ def cache_base_models(model_dir: str, force: bool = False) -> bool:
         if already_cached and not force:
             logger.info(f"Base model already cached: {model_id}")
             continue
-        if not ensure_base_model_auth(model_id):
+        if not ensure_base_model_auth(model_id, token=token):
             all_ok = False
             continue
         logger.info(f"Downloading base model: {model_id}")
         try:
-            snapshot_download(repo_id=model_id, repo_type="model", local_dir=local_dir)
+            snapshot_download(repo_id=model_id, repo_type="model", local_dir=local_dir, token=token or None)
             logger.info(f"Base model cached: {local_dir}")
         except Exception as e:
             logger.warning(
@@ -357,9 +366,13 @@ COMPONENTS = ("vhamster", "genomad", "ntv3")
 @click.option("--skip-base-model", is_flag=True, default=False,
               help="Skip downloading the NTv3 base transformer model. "
                    "Use only if you have already cached it or intend to authenticate later.")
+@click.option("--hf-token", "hf_token", default=None, envvar="HF_TOKEN",
+              help="HuggingFace API token. Skips browser login — useful for HPC/workflow "
+                   "environments. Can also be set via the HF_TOKEN environment variable "
+                   "(preferred, as CLI tokens are visible in process listings).")
 @click.option("--debug", is_flag=True, default=False,
               help="Enable verbose debug logging.")
-def main(outdir, force, debug, skip_base_model, only):
+def main(outdir, force, debug, skip_base_model, only, hf_token):
     """Download and install VHAMSTeR models from HuggingFace and the geNomad
     marker database from Zenodo.
 
@@ -390,7 +403,7 @@ def main(outdir, force, debug, skip_base_model, only):
         logger.info("Skipping base transformer model download (--skip-base-model).")
     elif install_all or "ntv3" in selected:
         logger.info("Downloading NTv3 base transformer model for offline use...")
-        cache_base_models(model_dir, force)
+        cache_base_models(model_dir, force, token=hf_token)
 
     logger.info("\n" + "=" * 60)
     logger.info("INSTALLATION SUMMARY")

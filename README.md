@@ -1,6 +1,10 @@
 # VHAMSTeR
 ![](vhamsterlogo.png)
 
+[![PyPI version](https://img.shields.io/pypi/v/vhamster)](https://pypi.org/project/vhamster/)
+[![PyPI downloads](https://img.shields.io/pypi/dm/vhamster)](https://pypi.org/project/vhamster/)
+[![Conda downloads](https://img.shields.io/conda/dn/bioconda/vhamster)](https://anaconda.org/bioconda/vhamster)
+[![install with bioconda](https://img.shields.io/badge/install%20with-bioconda-brightgreen.svg?style=flat)](https://bioconda.github.io/recipes/vhamster/README.html)
 
 **V**irus **H**ost **A**ssignment **M**odel using **S**equence **T**ransformers and **R**eading-frames
 
@@ -136,7 +140,13 @@ The installer places files at:
 - `<install_root>/genomad_db/` — geNomad marker database
 - `<install_root>/base_models/` — NTv3 base transformer model
 
-> **HPC / headless systems:** If no browser is available, run `huggingface-cli login` in your terminal first, then run `vhamster-install-models`.
+> **HPC / headless systems:** If no browser is available, either run `huggingface-cli login` in your terminal first, or pass your token directly:
+> ```bash
+> vhamster-install-models --hf-token $HF_TOKEN
+> # or set the environment variable (safer — token won't appear in process listings):
+> export HF_TOKEN=hf_xxxx
+> vhamster-install-models
+> ```
 
 > **Cluster shared installations:** The base model only needs to be downloaded once per shared filesystem location. If a colleague has already installed into the same `<install_root>`, you do not need to run it again.
 
@@ -198,6 +208,13 @@ this *Escherichia* phage.
 
 ## Run
 
+To see all available options:
+
+```bash
+vhamster --help            # common options
+vhamster --help-advanced   # all options including advanced/expert ones
+```
+
 Minimal example (models at their default installed location):
 
 ```bash
@@ -239,7 +256,7 @@ Use a non-default calibration parameters file:
 vhamster \
   --fasta /path/to/input.fasta \
   --output /path/to/results_dir \
-  --calibration-params /path/to/proportional_vector_scaling_scalar_nll_notclassbalanced_posthoc_fungi_nolength.json
+  --calibration-params /path/to/calibration.json
 ```
 
 ## Two-stage pipeline (HPC)
@@ -258,7 +275,7 @@ vhamster-features \
 This writes:
 - `features/batch_001/batch_001.arch_features.tsv` — per-chunk architectural features
 - `features/batch_001/batch_001.genomad_hits.json` — geNomad marker hits
-- `features/batch_001/batch_001.gene_predictions.tsv` — per-gene annotations
+- `features/batch_001/batch_001.viral_marker_genes.tsv` — per-gene annotations
 
 **Stage 2 — GLM inference (GPU node):**
 
@@ -275,13 +292,22 @@ The `--chunk-size` and `--overlap` values must match between the two stages (def
 
 ## Outputs
 
-For prefix `sampleA`, the unconditional output files are:
-- `/path/to/results_dir/sampleA.chunks.tsv` — per-chunk predictions
-- `/path/to/results_dir/sampleA.genomes.tsv` — genome-level consensus (mean-pooled over chunks)
-- `/path/to/results_dir/sampleA.folds.tsv` — per-fold predictions and GLM gate weights for all 5 ensemble members
+For prefix `sampleA`, these files are always produced:
 
-If the `--verbose` flag is passed, an additional file is generated:
-- `/path/to/results_dir/sampleA.verbose.tsv` — detailed per-fold uncalibrated stream probabilities, uncalibrated ensemble probabilities, and raw feature arrays.
+| File | Contents |
+|------|----------|
+| `sampleA.chunks.tsv` | Per-chunk host predictions with calibrated class probabilities |
+| `sampleA.genomes.tsv` | Genome-level consensus (mean-pooled over chunks) |
+| `sampleA.folds.tsv` | Per-fold calibrated predictions and GLM gate weights for all 5 ensemble members |
+| `sampleA.viral_marker_genes.tsv` | Genes with a geNomad viral marker hit (subset of all predicted genes) |
+| `sampleA.log` | Full run log |
+
+Optional additional files (pass one or both flags):
+
+| Flag | File | Contents |
+|------|------|----------|
+| `--model-scores` | `sampleA.model_scores.tsv` | Per-fold XGBoost, GLM and uncalibrated ensemble probabilities — use this to inspect individual model component scores |
+| `--save-features` | `sampleA.features.tsv` | Input features fed to the model per chunk — architectural stats and geNomad marker features |
 
 ### Chunk Naming Convention
 Sequences longer than the specified chunk size (default 10 kbp) are split into smaller fragments. The `accession` column for these fragments will include a `_chunk<start>_<end>` suffix (e.g., `NC_007026.1_chunk0_10000`). You can use this suffix or the `sampleA.genomes.tsv` file to join chunk-level predictions back to your original input sequences.
@@ -302,13 +328,17 @@ Sequences longer than the specified chunk size (default 10 kbp) are split into s
 - `accession`, `fold`, `predicted_host`, `confidence`, `glm_gate_weight`
 - calibrated class probability columns
 
-**Verbose file columns include:**
+**Model scores file (`--model-scores`) columns include:**
 - `accession`, `fold`, `n_genes`, `predicted_host`, `confidence`, `glm_gate_weight`
 - calibrated class probability columns
 - `xgb_<class>` (pure, uncalibrated XGBoost probabilities)
 - `glm_<class>` (pure, uncalibrated GLM probabilities)
 - `uncalibrated_ensemble_<class>` (the exact mathematical output of the dynamic gate before temperature scaling)
-- All raw architectural and marker features
+
+**Features file (`--save-features`) columns include:**
+- `accession`
+- All architectural features (gene density, fragment size, etc.)
+- All geNomad marker features
 
 ## Performance & Batching Tips
 
@@ -329,7 +359,6 @@ vhamster --fasta all_seqs.fasta --output out/ --prefix all_seqs
 ```
 
 ## Citation 
-
 **Preprint coming soon!** 
 
 In the meantime you can cite 
