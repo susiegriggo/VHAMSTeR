@@ -446,9 +446,19 @@ def _run(args: Any) -> None:
     logger.info("[4/5] Running ensemble inference across folds")
     accumulated_logits: Optional[torch.Tensor] = None
     accumulated_xgb_probs: Optional[np.ndarray] = None
+    # Pre-compute these once — used in every fold for calibration and output writing.
+    chunk_lengths = [len(s) for s in chunked_seqs]
+    class_cols = [label_mapping.get(i, f"class_{i}") for i in range(num_classes)]
+    n_genes_list = features_df_arch.get_column('n_genes').to_list()
+
     per_fold_basic: List[Dict] = []
-    per_fold_verbose: List[Dict] = [] if args.model_scores else None
     _saved_features: Optional[List[Dict]] = None  # captured from first fold for --save-features
+
+    # Streaming output state — write each fold to disk immediately to avoid RAM accumulation.
+    folds_path = args.output_dir / f"{args.prefix}.folds.tsv"
+    scores_path = args.output_dir / f"{args.prefix}.model_scores.tsv"
+    _folds_written = False
+    _scores_written = False
 
     for fold_idx, fold_dir in enumerate(args.fold_dirs_resolved, start=1):
         logger.info(f"--- Fold {fold_idx}/{len(args.fold_dirs_resolved)}: {fold_dir.name} ---")
@@ -745,31 +755,70 @@ def _run(args: Any) -> None:
         else:
             fold_alphas = np.full(len(chunked_seqs), np.nan)
         
-        per_fold_basic.append({"fold_name": fold_dir.name, "logits": fold_logits, "alphas": fold_alphas})
+        # Apply per-fold calibration immediately so probs are available for streaming output.
+        fold_probs = _apply_calibration(fold_logits, calib_params, chunk_lengths, num_classes)
+        per_fold_basic.append({"fold_name": fold_dir.name, "logits": fold_logits, "alphas": fold_alphas, "probs": fold_probs})
 
+        # ── Stream folds.tsv for this fold ───────────────────────────────────
+        fold_pred_indices = np.argmax(fold_probs, axis=1)
+        fold_confidences = np.max(fold_probs, axis=1)
+        fold_predicted_hosts = [label_mapping.get(int(i), f"class_{i}") for i in fold_pred_indices]
+        df_fold = pl.DataFrame([
+            {
+                "accession": acc,
+                "fold": fold_dir.name,
+                "predicted_host": fold_predicted_hosts[j],
+                "confidence": round(float(fold_confidences[j]), 4),
+                "glm_gate_weight": None if np.isnan(fold_alphas[j]) else round(float(fold_alphas[j]), 4),
+                **{col: round(float(fold_probs[j, i]), 4) for i, col in enumerate(class_cols)},
+            }
+            for j, acc in enumerate(chunked_accs)
+        ])
+        with open(folds_path, "a" if _folds_written else "w", newline="") as _fh:
+            df_fold.write_csv(_fh, separator="\t", include_header=not _folds_written, null_value="")
+        _folds_written = True
+        del df_fold, fold_pred_indices, fold_confidences, fold_predicted_hosts
+
+        # ── Stream model_scores.tsv for this fold (if requested) ─────────────
         if args.model_scores:
-            # 1. Pure, uncalibrated XGBoost probabilities
             fold_xgb_probs = np.round(xgb_probs, 4)
-            
-            # 2. Pure, uncalibrated GLM probabilities
             if fold_glm_logits_list and all(x is not None for x in fold_glm_logits_list):
                 concat_glm = torch.cat(fold_glm_logits_list, dim=0)[reorder_indices]
                 fold_glm_probs = np.round(F.softmax(concat_glm, dim=-1).numpy(), 4)
             else:
                 fold_glm_probs = None
-
-            # 3. Pure, uncalibrated Ensemble probabilities (The raw math output from the gate)
             fold_raw_ensemble_probs = np.round(torch.softmax(fold_logits, dim=-1).numpy(), 4)
-                
-            per_fold_verbose.append({
-                "fold_name": fold_dir.name,
-                "logits": fold_logits,
-                "alphas": fold_alphas,
-                "features": fold_features_dicts,
-                "xgb_probs": fold_xgb_probs,
-                "glm_probs": fold_glm_probs,
-                "raw_ensemble_probs": fold_raw_ensemble_probs,
-            })
+
+            _score_fold_pred_indices = np.argmax(fold_probs, axis=1)
+            _score_fold_confidences = np.max(fold_probs, axis=1)
+            _score_fold_hosts = [label_mapping.get(int(i), f"class_{i}") for i in _score_fold_pred_indices]
+            score_rows = []
+            for j, acc in enumerate(chunked_accs):
+                row: Dict = {
+                    "accession": acc,
+                    "fold": fold_dir.name,
+                    "n_genes": n_genes_list[j],
+                    "predicted_host": _score_fold_hosts[j],
+                    "confidence": float(_score_fold_confidences[j]),
+                    "glm_gate_weight": None if np.isnan(fold_alphas[j]) else float(fold_alphas[j]),
+                    **{col: float(fold_probs[j, i]) for i, col in enumerate(class_cols)},
+                }
+                if fold_xgb_probs is not None:
+                    for i, col in enumerate(class_cols):
+                        row[f"xgb_{col}"] = float(fold_xgb_probs[j, i])
+                if fold_glm_probs is not None:
+                    for i, col in enumerate(class_cols):
+                        row[f"glm_{col}"] = float(fold_glm_probs[j, i])
+                if fold_raw_ensemble_probs is not None:
+                    for i, col in enumerate(class_cols):
+                        row[f"uncalibrated_ensemble_{col}"] = float(fold_raw_ensemble_probs[j, i])
+                score_rows.append(row)
+            df_scores = pl.DataFrame(score_rows)
+            with open(scores_path, "a" if _scores_written else "w", newline="") as _fh:
+                df_scores.write_csv(_fh, separator="\t", include_header=not _scores_written, null_value="")
+            _scores_written = True
+            del df_scores, score_rows, fold_xgb_probs, fold_glm_probs, fold_raw_ensemble_probs
+            del _score_fold_pred_indices, _score_fold_confidences, _score_fold_hosts
             
         if accumulated_logits is None:
             accumulated_logits = fold_logits.clone()
@@ -783,16 +832,8 @@ def _run(args: Any) -> None:
 
    # ── [5/5] Post-Ensemble Calibration & Aggregation ────────────────────────
     logger.info(f"[5/5] Applying calibration & chunk aggregation (Mode: {args.aggregation_mode})")
-    chunk_lengths = [len(s) for s in chunked_seqs]
 
-    # 1. Pre-calculate individual calibrated probabilities for ALL folds
-    for fold_data in per_fold_basic:
-        fold_data["probs"] = _apply_calibration(fold_data["logits"], calib_params, chunk_lengths, num_classes)
-        
-    if args.model_scores:
-        for fold_data in per_fold_verbose:
-            fold_data["probs"] = _apply_calibration(fold_data["logits"], calib_params, chunk_lengths, num_classes)
-
+    # Per-fold probs were already applied during the fold loop; aggregate here.
     # 2. Aggregate according to the selected mode
     if args.aggregation_mode == "logit":
         # Standard: average the raw logits, then calibrate the result
@@ -827,8 +868,6 @@ def _run(args: Any) -> None:
         calibrated_probs = np.round(weighted_probs.sum(axis=0), 4)
 
     
-    class_cols = [label_mapping.get(i, f"class_{i}") for i in range(num_classes)]
-
     pred_indices = np.argmax(calibrated_probs, axis=1)
     confidences_arr = np.max(calibrated_probs, axis=1)
     
@@ -878,67 +917,9 @@ def _run(args: Any) -> None:
         logger.info(f"Genome-level predictions written to: {args.genome_output}")
 
         
-    fold_rows: List[Dict] = []
-    for fold_data in per_fold_basic:
-        fold_probs = fold_data["probs"]
-        fold_alphas = fold_data["alphas"]
-        fold_pred_indices = np.argmax(fold_probs, axis=1)
-        fold_confidences = np.max(fold_probs, axis=1)
-        fold_predicted_hosts = [label_mapping.get(int(i), f"class_{i}") for i in fold_pred_indices]
-        for j, acc in enumerate(chunked_accs):
-            row: Dict = {
-                "accession": acc,
-                "fold": fold_data["fold_name"],
-                "predicted_host": fold_predicted_hosts[j],
-                "confidence": round(float(fold_confidences[j]), 4),
-                "glm_gate_weight": None if np.isnan(fold_alphas[j]) else round(float(fold_alphas[j]), 4),
-                **{col: round(float(fold_probs[j, i]), 4) for i, col in enumerate(class_cols)},
-            }
-            fold_rows.append(row)
-    df_folds = pl.DataFrame(fold_rows).sort(["accession", "fold"])
-    folds_path = args.output_dir / f"{args.prefix}.folds.tsv"
-    df_folds.write_csv(folds_path, separator="\t", null_value="")
     logger.info(f"Per-fold predictions written to: {folds_path}")
-
-    if args.model_scores and per_fold_verbose:
-        verbose_rows = []
-
-        n_genes_list = features_df_arch.get_column('n_genes').to_list()
-
-        for fold_data in per_fold_verbose:
-            fold_probs = fold_data["probs"]
-            fold_alphas = fold_data["alphas"]
-            fold_pred_indices = np.argmax(fold_probs, axis=1)
-            fold_confidences = np.max(fold_probs, axis=1)
-            fold_predicted_hosts = [label_mapping.get(int(i), f"class_{i}") for i in fold_pred_indices]
-            for j, acc in enumerate(chunked_accs):
-                row: Dict = {
-                    "accession": acc,
-                    "fold": fold_data["fold_name"],
-                    "n_genes": n_genes_list[j],
-                    "predicted_host": fold_predicted_hosts[j],
-                    "confidence": float(fold_confidences[j]),
-                    "glm_gate_weight": None if np.isnan(fold_alphas[j]) else float(fold_alphas[j]),
-                }
-                for i, col in enumerate(class_cols):
-                    row[col] = float(fold_probs[j, i])
-
-                if fold_data.get("xgb_probs") is not None:
-                    for i, col in enumerate(class_cols):
-                        row[f"xgb_{col}"] = float(fold_data["xgb_probs"][j, i])
-                if fold_data.get("glm_probs") is not None:
-                    for i, col in enumerate(class_cols):
-                        row[f"glm_{col}"] = float(fold_data["glm_probs"][j, i])
-                if fold_data.get("raw_ensemble_probs") is not None:
-                    for i, col in enumerate(class_cols):
-                        row[f"uncalibrated_ensemble_{col}"] = float(fold_data["raw_ensemble_probs"][j, i])
-
-                verbose_rows.append(row)
-
-        df_verbose = pl.DataFrame(verbose_rows).sort(["accession", "fold"])
-        verbose_path = args.output_dir / f"{args.prefix}.model_scores.tsv"
-        df_verbose.write_csv(verbose_path, separator="\t")
-        logger.info(f"Per-fold model scores written to: {verbose_path}")
+    if args.model_scores:
+        logger.info(f"Per-fold model scores written to: {scores_path}")
 
     if args.save_features and _saved_features is not None:
         feature_rows = [{"accession": acc, **feats}
@@ -1222,7 +1203,8 @@ def main(
         genome_output=output_dir / f"{prefix}.genomes.tsv",
         mask_features=mask_features,
         mask_target=mask_target,
-        verbose=verbose,
+        model_scores=model_scores,
+        save_features=save_features,
         evalue=evalue,
         aggregation_mode=aggregation_mode,
         min_coverage=min_coverage,
