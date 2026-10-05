@@ -256,7 +256,7 @@ Use a non-default calibration parameters file:
 vhamster \
   --fasta /path/to/input.fasta \
   --output /path/to/results_dir \
-  --calibration-params /path/to/proportional_vector_scaling_scalar_nll_notclassbalanced_posthoc_fungi_nolength.json
+  --calibration-params /path/to/calibration.json
 ```
 
 ## Two-stage pipeline (HPC)
@@ -292,12 +292,17 @@ The `--chunk-size` and `--overlap` values must match between the two stages (def
 
 ## Outputs
 
-For prefix `sampleA`, the unconditional output files are:
-- `/path/to/results_dir/sampleA.chunks.tsv` — per-chunk predictions
-- `/path/to/results_dir/sampleA.genomes.tsv` — genome-level consensus (mean-pooled over chunks)
-- `/path/to/results_dir/sampleA.folds.tsv` — per-fold predictions and GLM gate weights for all 5 ensemble members
+For prefix `sampleA`, these files are always produced:
 
-Optional additional files (one or both flags can be combined):
+| File | Contents |
+|------|----------|
+| `sampleA.chunks.tsv` | Per-chunk host predictions with calibrated class probabilities |
+| `sampleA.genomes.tsv` | Genome-level consensus (mean-pooled over chunks) |
+| `sampleA.folds.tsv` | Per-fold calibrated predictions and GLM gate weights for all 5 ensemble members |
+| `sampleA.viral_marker_genes.tsv` | Genes with a geNomad viral marker hit (subset of all predicted genes) |
+| `sampleA.log` | Full run log |
+
+Optional additional files (pass one or both flags):
 
 | Flag | File | Contents |
 |------|------|----------|
@@ -352,9 +357,6 @@ vhamster --fasta seq3.fasta --output out/ --prefix seq3
 cat seq1.fasta seq2.fasta seq3.fasta > all_seqs.fasta
 vhamster --fasta all_seqs.fasta --output out/ --prefix all_seqs
 ```
-## Citation 
-Preprint coming soon! 
-
 ## Citation 
 
 **Preprint coming soon!** 
