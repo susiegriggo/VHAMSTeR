@@ -261,13 +261,20 @@ def _aggregate_chunks(
     class_cols: List[str],
     prok_col_idx: Optional[int],
     label_mapping: Dict[int, str],
+    scaffold_delimiter: Optional[str] = None,
 ) -> pl.DataFrame:
-    """Max-score weighted average of per-class probabilities across chunks."""
-    genome_col = (
-        pl.col("accession")
-        .str.replace(r"_chunk\d+_\d+$", "", literal=False)
-        .alias("genome")
-    )
+    """Max-score weighted average of per-class probabilities across chunks.
+
+    When *scaffold_delimiter* is set, the genome ID is extracted by (1) stripping
+    the ``_chunk<start>_<end>`` suffix and then (2) taking the substring before the
+    first occurrence of the delimiter.  This collapses predictions made on individual
+    scaffolds of a multi-scaffold genome (e.g. giant viruses) into a single
+    genome-level prediction, using the same weighted-average logic applied to chunks.
+    """
+    genome_expr = pl.col("accession").str.replace(r"_chunk\d+_\d+$", "", literal=False)
+    if scaffold_delimiter is not None:
+        genome_expr = genome_expr.str.split(scaffold_delimiter).list.first()
+    genome_col = genome_expr.alias("genome")
     df = chunk_df.with_columns(genome_col)
 
     # --- FIX: Use chunk_weight for math, not the reporting confidence ---
@@ -912,7 +919,9 @@ def _run(args: Any) -> None:
     df_chunks.drop("chunk_weight").write_csv(args.output, separator="\t", null_value="")
 
     if args.aggregate_chunks:
-        df_genomes = _aggregate_chunks(df_chunks, class_cols, prok_col_idx, label_mapping)
+        if args.scaffold_delimiter is not None:
+            logger.info(f"Scaffold aggregation enabled (delimiter: {args.scaffold_delimiter!r})")
+        df_genomes = _aggregate_chunks(df_chunks, class_cols, prok_col_idx, label_mapping, scaffold_delimiter=args.scaffold_delimiter)
         df_genomes.write_csv(args.genome_output, separator="\t", null_value="")
         logger.info(f"Genome-level predictions written to: {args.genome_output}")
 
@@ -1129,6 +1138,7 @@ def _preflight_checks(args: Any) -> None:
 @click.option("--min-coverage", type=float, default=0.0, show_default=True, hidden=True, help="Minimum bidirectional coverage threshold (0.0 to 1.0).")
 @click.option("--evalue", type=float, default=1e-3, show_default=True, hidden=True, help="E-value threshold for MMseqs2 marker hits.")
 @click.option("--aggregation-mode", type=click.Choice(['logit', 'probability', 'entropy']), default='logit', show_default=True, hidden=True, help="Method used to aggregate fold predictions.")
+@click.option("--scaffold-delimiter", type=str, default=None, show_default=True, hidden=True, help="Delimiter used to group scaffolds into a single genome for aggregation. When set, the genome ID is extracted by stripping the chunk suffix and then taking the substring before the first occurrence of this delimiter. Use '|' for IMGVR-style accessions (e.g. 'UVIG_id|study_id|taxon_id'). Disabled by default; enable only for multi-scaffold genomes such as giant viruses.")
 @click.option("--mask-features", type=click.Choice(['none', 'density', 'boundary', 'density_plus_boundary']), default='none', hidden=True, help="Conditionally mask out specific feature sets with NaNs for ablation testing.")
 @click.option("--mask-target", type=click.Choice(['all', 'xgb1_only', 'xgb2_only']), default='all', hidden=True, help="Which XGBoost model to apply the mask to.")
 
@@ -1159,6 +1169,7 @@ def main(
     aggregation_mode: str,
     evalue: float,
     min_coverage: float,
+    scaffold_delimiter: Optional[str],
 ) -> None:
     output_dir = output
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1208,6 +1219,7 @@ def main(
         evalue=evalue,
         aggregation_mode=aggregation_mode,
         min_coverage=min_coverage,
+        scaffold_delimiter=scaffold_delimiter,
     )
 
     args.fold_dirs_resolved = _discover_fold_dirs(args)

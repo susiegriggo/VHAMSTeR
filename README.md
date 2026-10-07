@@ -312,6 +312,21 @@ Optional additional files (pass one or both flags):
 ### Chunk Naming Convention
 Sequences longer than the specified chunk size (default 10 kbp) are split into smaller fragments. The `accession` column for these fragments will include a `_chunk<start>_<end>` suffix (e.g., `NC_007026.1_chunk0_10000`). You can use this suffix or the `sampleA.genomes.tsv` file to join chunk-level predictions back to your original input sequences.
 
+### Multi-scaffold genomes (advanced)
+
+Some large DNA viruses (e.g. giant viruses) are assembled as multiple scaffolds rather than a single contiguous sequence, each with a distinct FASTA accession. By default VHAMSTeR treats every scaffold as an independent genome and writes one row per scaffold to `sampleA.genomes.tsv`. Use `--scaffold-delimiter` to instead group scaffolds that share a common genome ID prefix into a single genome-level prediction.
+
+The delimiter is applied **after** stripping the `_chunk<start>_<end>` suffix, and the genome ID is taken as the substring **before the first occurrence** of the delimiter. For example, with IMGVR-style accessions of the form `UVIG_id|study_id|taxon_id`, passing `--scaffold-delimiter '|'` groups all scaffolds with the same `UVIG_id` and aggregates their chunk-level probabilities using the same confidence-weighted average used for ordinary chunk aggregation.
+
+```bash
+vhamster \
+  --fasta giant_viruses.fasta \
+  --output results/ \
+  --scaffold-delimiter '|'
+```
+
+This flag is disabled by default and is only needed when your input contains multi-scaffold genomes whose accessions share a common prefix separated by a known delimiter.
+
 ### File Schemas
 
 **Chunk file columns include:**
