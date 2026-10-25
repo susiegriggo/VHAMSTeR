@@ -359,10 +359,9 @@ vhamster --fasta all_seqs.fasta --output out/ --prefix all_seqs
 ```
 
 ## Citation 
-**Preprint coming soon!** 
+If you use VHAMSTeR please cite the preprint: 
 
-In the meantime you can cite 
-* Grigson S. R., Roux, S. (2026). VHAMSTeR: Virus Host Assignment Model using Sequence Transformers and Reading-frames (v1.4.0).  [https://github.com/susiegriggo/VHAMSTeR](https://github.com/susiegriggo/VHAMSTeR)
+Grigson S. R., Roux, S. (2026).  Viral host assignment across the tree of life with VHAMSTeR. *bioRxiv*, [https://www.biorxiv.org/content/10.64898/2026.10.23.761443v1](https://www.biorxiv.org/content/10.64898/2026.10.23.761443v1)
 
 If you use VHAMSTeR in your research, please also cite the foundational tools that power our feature extraction pipeline:
 
